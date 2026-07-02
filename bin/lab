@@ -1,0 +1,2107 @@
+#!/usr/bin/env bash
+
+is_sourced() {
+  [[ "${BASH_SOURCE[0]}" != "${0}" ]]
+}
+
+if ! is_sourced; then
+  set -euo pipefail
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$( cd $SCRIPT_DIR/.. && pwd)"
+CONFIG_DIR="$BASE_DIR/config"
+
+DOWNLOAD_DIR=$BASE_DIR/Downloads
+mkdir -p $DOWNLOAD_DIR
+
+
+
+# trap 'echo "error at line $LINENO" >&2' ERR
+
+# Use the system libvirt without repeating -c flags
+export LIBVIRT_DEFAULT_URI="${LIBVIRT_DEFAULT_URI:-qemu:///system}"
+
+read_config() {
+CONFIG_READ=1
+
+. $CONFIG_DIR/defaults.sh
+
+CLUSTER_ENV="${CLUSTER_ENV:-cluster.env}"
+
+. "lab-env.sh"
+LAB_DIR="$(pwd)"
+
+if [ "${LAB_PREFIX_OVERRIDE_SET:-0}" -eq 1 ]; then
+  LAB_PREFIX="$LAB_PREFIX_OVERRIDE"
+elif [ -z "${LAB_PREFIX:-}" ]; then
+  LAB_PREFIX="$(default_lab_prefix)"
+else
+  LAB_PREFIX="${LAB_PREFIX:-}"
+fi
+validate_lab_prefix
+resolve_network_config
+validate_network_hook_chain_names
+validate_sync_dirs
+
+if test -n "$SSH_PUBKEY_PATH"; then
+  SSH_PUBKEY="$(<"$SSH_PUBKEY_PATH")";
+fi
+
+if test -z "$SSH_PUBKEY"; then
+  echo "No ssh public key found" >&2
+  return 1
+fi
+FINAL_VOL=$BASE_VOL
+local script=$BASE_DIR/node-setup/$NODE_SETUP/customize-image.sh
+if test -f $script; then
+  FINAL_VOL=$BASE_VOL-$NODE_SETUP
+fi
+}
+
+validate_sync_dirs() {
+declare -gA SYNC_DIRS_RESOLVED=()
+if ! declare -p SYNC_DIRS >/dev/null 2>&1; then
+  declare -gA SYNC_DIRS=()
+fi
+local sync_decl
+sync_decl="$(declare -p SYNC_DIRS 2>/dev/null || true)"
+if [[ "$sync_decl" != declare\ -A* && "$sync_decl" != declare\ -gA* && "$sync_decl" != declare\ -Ag* ]]; then
+  echo "SYNC_DIRS must be an associative array in lab-env.sh" >&2
+  return 1
+fi
+local src dst src_abs
+for src in "${!SYNC_DIRS[@]}"; do
+  dst="${SYNC_DIRS[$src]}"
+  if [ -z "$src" ] || [ -z "$dst" ]; then
+    echo "SYNC_DIRS entries must have non-empty source and destination" >&2
+    return 1
+  fi
+  if [[ "$src" = /* ]]; then
+    src_abs="$src"
+  else
+    src_abs="$LAB_DIR/$src"
+  fi
+  if [ ! -d "$src_abs" ]; then
+    echo "SYNC source directory does not exist: $src_abs (from key '$src')" >&2
+    return 1
+  fi
+  src_abs="$(cd "$src_abs" && pwd -P)"
+  if [[ "$dst" != /* ]]; then
+    echo "SYNC destination must be absolute on nodes: '$dst' (for source '$src')" >&2
+    return 1
+  fi
+  if [ -n "${SYNC_DIRS_RESOLVED[$src_abs]:-}" ] && [ "${SYNC_DIRS_RESOLVED[$src_abs]}" != "$dst" ]; then
+    echo "SYNC source resolves to duplicate path with conflicting destinations: $src_abs" >&2
+    return 1
+  fi
+  SYNC_DIRS_RESOLVED["$src_abs"]="$dst"
+done
+}
+
+sync_state_dir() {
+echo "$LAB_DIR/.lab-sync"
+}
+
+sync_id() {
+local node="$1"
+local src="$2"
+local dst="$3"
+printf '%s\t%s\t%s\n' "$node" "$src" "$dst" | sha1sum | awk '{print $1}'
+}
+
+sync_pid_file() {
+local id="$1"
+echo "$(sync_state_dir)/$id.pid"
+}
+
+sync_meta_file() {
+local id="$1"
+echo "$(sync_state_dir)/$id.meta"
+}
+
+sync_log_file() {
+local id="$1"
+echo "$(sync_state_dir)/$id.log"
+}
+
+sync_event_file() {
+local id="$1"
+echo "$(sync_state_dir)/$id.events"
+}
+
+default_lab_prefix() {
+local dir name
+dir="${LAB_DIR:-$(pwd)}"
+name="$(basename "$dir")"
+name="${name,,}"
+name="${name//[^a-z0-9_-]/-}"
+while [[ "$name" =~ ^[^a-z0-9] ]]; do
+  name="${name#?}"
+done
+if [ -z "$name" ]; then
+  name="lab"
+fi
+echo "$name"
+}
+
+network_prefix_file() {
+echo "$LAB_DIR/.network"
+}
+
+is_ipv4_octet() {
+local value="$1"
+[[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -ge 0 ] && [ "$value" -le 255 ]
+}
+
+validate_network_prefix() {
+local prefix="$1"
+local label="${2:-NET_PREFIX}"
+local a b c rest
+IFS=. read -r a b c rest <<<"$prefix"
+if [ -n "${rest:-}" ] || ! is_ipv4_octet "${a:-}" || ! is_ipv4_octet "${b:-}" || ! is_ipv4_octet "${c:-}"; then
+  echo "$label must be the first three octets of an IPv4 /24, for example 192.168.125: $prefix" >&2
+  return 1
+fi
+}
+
+validate_network_pool_config() {
+local a b rest
+IFS=. read -r a b rest <<<"$NET_PREFIX_POOL_BASE"
+if [ -n "${rest:-}" ] || ! is_ipv4_octet "${a:-}" || ! is_ipv4_octet "${b:-}"; then
+  echo "NET_PREFIX_POOL_BASE must be the first two octets of an IPv4 range, for example 192.168: $NET_PREFIX_POOL_BASE" >&2
+  return 1
+fi
+if ! is_ipv4_octet "$NET_PREFIX_POOL_START" || ! is_ipv4_octet "$NET_PREFIX_POOL_END"; then
+  echo "NET_PREFIX_POOL_START and NET_PREFIX_POOL_END must be IPv4 octets: $NET_PREFIX_POOL_START-$NET_PREFIX_POOL_END" >&2
+  return 1
+fi
+if [ "$NET_PREFIX_POOL_START" -gt "$NET_PREFIX_POOL_END" ]; then
+  echo "NET_PREFIX_POOL_START must be <= NET_PREFIX_POOL_END: $NET_PREFIX_POOL_START-$NET_PREFIX_POOL_END" >&2
+  return 1
+fi
+}
+
+read_network_prefix_file() {
+local file="$1"
+local line value
+[ -f "$file" ] || return 1
+while IFS= read -r line || [ -n "$line" ]; do
+  line="${line%$'\r'}"
+  case "$line" in
+    NET_PREFIX=*)
+      value="${line#NET_PREFIX=}"
+      case "$value" in
+        \"*\") value="${value#\"}"; value="${value%\"}" ;;
+        \'*\') value="${value#\'}"; value="${value%\'}" ;;
+      esac
+      echo "$value"
+      return 0
+      ;;
+  esac
+done < "$file"
+return 1
+}
+
+write_network_prefix_file() {
+local prefix="$1"
+local file tmp
+file="$(network_prefix_file)"
+tmp="$(mktemp "$(dirname "$file")/.network.XXXXXX")"
+if ! printf 'NET_PREFIX=%s\n' "$prefix" > "$tmp"; then
+  rm -f "$tmp"
+  return 1
+fi
+mv "$tmp" "$file"
+}
+
+derive_network_values() {
+NET_ADDR="${NET_PREFIX}.1"
+NET_MASK=255.255.255.0
+NET_PREFIX_LEN=24
+DHCP_START="${NET_PREFIX}.100"
+DHCP_END="${NET_PREFIX}.254"
+}
+
+extract_network_prefixes_from_xml() {
+sed -n "s/.*<ip address=['\"]\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)\.[0-9][0-9]*['\"].*/\1/p"
+}
+
+collect_host_network_prefix_entries() {
+command -v ip >/dev/null 2>&1 || return 0
+{
+  ip -o -4 addr show 2>/dev/null | awk '
+    function emit_prefix(value, owner, parts) {
+      sub(/\/.*/, "", value)
+      if (split(value, parts, ".") == 4 &&
+          parts[1] ~ /^[0-9]+$/ &&
+          parts[2] ~ /^[0-9]+$/ &&
+          parts[3] ~ /^[0-9]+$/ &&
+          parts[4] ~ /^[0-9]+$/) {
+        print parts[1] "." parts[2] "." parts[3] "\t" owner
+      }
+    }
+    {
+      owner = $2
+      sub(/@.*/, "", owner)
+      for (i = 1; i < NF; i++) {
+        if ($i == "inet") {
+          emit_prefix($(i + 1), owner)
+        }
+      }
+    }
+  ' || true
+  ip -4 route show 2>/dev/null | awk '
+    function emit_prefix(value, owner, parts) {
+      sub(/\/24$/, "", value)
+      if (split(value, parts, ".") == 4 &&
+          parts[1] ~ /^[0-9]+$/ &&
+          parts[2] ~ /^[0-9]+$/ &&
+          parts[3] ~ /^[0-9]+$/ &&
+          parts[4] == "0") {
+        print parts[1] "." parts[2] "." parts[3] "\t" owner
+      }
+    }
+    $1 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.0\/24$/ {
+      owner = "route"
+      for (i = 1; i < NF; i++) {
+        if ($i == "dev") {
+          owner = "route dev " $(i + 1)
+        }
+      }
+      emit_prefix($1, owner)
+    }
+  ' || true
+}
+}
+
+collect_host_network_prefixes() {
+local prefix owner
+while IFS=$'\t' read -r prefix owner; do
+  [ -n "$prefix" ] && echo "$prefix"
+done < <(collect_host_network_prefix_entries)
+}
+
+host_network_prefix_owners() {
+local needle="$1"
+local prefix owner
+while IFS=$'\t' read -r prefix owner; do
+  if [ "$prefix" = "$needle" ]; then
+    echo "${owner:-host network}"
+  fi
+done < <(collect_host_network_prefix_entries)
+}
+
+format_host_network_prefix_owners() {
+local prefix="$1"
+local owner out
+out=
+while IFS= read -r owner; do
+  [ -n "$owner" ] || continue
+  if [ -n "$out" ]; then
+    out="$out, $owner"
+  else
+    out="$owner"
+  fi
+done < <(host_network_prefix_owners "$prefix" | sort -u)
+echo "$out"
+}
+
+network_prefix_conflict_hint() {
+case "${NET_PREFIX_SOURCE:-}" in
+  "using configured NET_PREFIX")
+    echo "Choose a different NET_PREFIX, or unset NET_PREFIX to allow automatic allocation." >&2
+    ;;
+  "using previously assigned address from .network")
+    echo "Remove or edit $(network_prefix_file), or run lab purge before forcing a new allocation." >&2
+    ;;
+  "allocated new network address"*)
+    echo "Internal allocator error: selected a host-used NET_PREFIX. Please report this with the output of: ip -4 addr show; ip -4 route show" >&2
+    ;;
+  *)
+    echo "Choose a different NET_PREFIX source, or remove the conflicting host interface/network after confirming it is unused." >&2
+    ;;
+esac
+}
+
+check_network_prefix_not_in_host_use() {
+local owners
+owners="$(format_host_network_prefix_owners "$NET_PREFIX")"
+[ -z "$owners" ] && return 0
+echo "NET_PREFIX=$NET_PREFIX is already in use on this host by: $owners" >&2
+echo "Source: ${NET_PREFIX_SOURCE:-current lab config}" >&2
+network_prefix_conflict_hint
+return 1
+}
+
+network_prefix_from_libvirt_network() {
+local net_name="$1"
+local xml prefix
+command -v virsh >/dev/null 2>&1 || return 1
+virsh net-info "$net_name" >/dev/null 2>&1 || return 1
+xml="$(virsh net-dumpxml "$net_name" 2>/dev/null)" || return 1
+prefix="$(printf '%s\n' "$xml" | extract_network_prefixes_from_xml | head -n1)"
+[ -n "$prefix" ] || return 1
+validate_network_prefix "$prefix" "existing libvirt network $net_name prefix" >/dev/null 2>&1 || return 1
+echo "$prefix"
+}
+
+collect_used_network_prefixes() {
+local file prefix net
+while IFS= read -r -d '' file; do
+  prefix="$(read_network_prefix_file "$file" 2>/dev/null || true)"
+  if [ -n "$prefix" ]; then
+    echo "$prefix"
+  fi
+done < <(find "$BASE_DIR" -path "$BASE_DIR/.git" -prune -o -name .network -type f -print0 2>/dev/null)
+
+if command -v virsh >/dev/null 2>&1; then
+  while IFS= read -r net; do
+    [ -n "$net" ] || continue
+    virsh net-dumpxml "$net" 2>/dev/null | extract_network_prefixes_from_xml || true
+  done < <(virsh net-list --all --name 2>/dev/null || true)
+fi
+
+collect_host_network_prefixes
+}
+
+choose_network_prefix() {
+validate_network_pool_config || return 1
+declare -A used=()
+local prefix i
+while IFS= read -r prefix; do
+  if validate_network_prefix "$prefix" "discovered network prefix" >/dev/null 2>&1; then
+    used["$prefix"]=1
+  fi
+done < <(collect_used_network_prefixes)
+
+for ((i = 10#$NET_PREFIX_POOL_START; i <= 10#$NET_PREFIX_POOL_END; i++)); do
+  prefix="${NET_PREFIX_POOL_BASE}.${i}"
+  if [ -z "${used[$prefix]:-}" ]; then
+    echo "$prefix"
+    return 0
+  fi
+done
+echo "No free NET_PREFIX found in pool ${NET_PREFIX_POOL_BASE}.${NET_PREFIX_POOL_START}-${NET_PREFIX_POOL_END}" >&2
+return 1
+}
+
+allocate_network_prefix() {
+local lock_file lock_fd prefix
+lock_file="$BASE_DIR/.network.lock"
+exec {lock_fd}>"$lock_file"
+flock "$lock_fd"
+if ! prefix="$(choose_network_prefix)"; then
+  exec {lock_fd}>&-
+  return 1
+fi
+if ! write_network_prefix_file "$prefix"; then
+  exec {lock_fd}>&-
+  return 1
+fi
+exec {lock_fd}>&-
+echo "$prefix"
+}
+
+resolve_network_config() {
+local saved prefix_file existing net_name
+prefix_file="$(network_prefix_file)"
+net_name="$(network_resource_name)"
+NET_PREFIX_SOURCE=
+if [ -n "${NET_PREFIX:-}" ]; then
+  validate_network_prefix "$NET_PREFIX" "NET_PREFIX" || return 1
+  derive_network_values
+  NET_PREFIX_SOURCE="using configured NET_PREFIX"
+  return 0
+fi
+existing="$(network_prefix_from_libvirt_network "$net_name" || true)"
+if saved="$(read_network_prefix_file "$prefix_file")"; then
+  validate_network_prefix "$saved" "$prefix_file NET_PREFIX" || return 1
+  if [ -n "$existing" ] && [ "$existing" != "$saved" ]; then
+    NET_PREFIX="$existing"
+    derive_network_values
+    write_network_prefix_file "$NET_PREFIX" || return 1
+    NET_PREFIX_SOURCE="using previously assigned address from existing libvirt network; updated stale .network from $saved"
+    return 0
+  fi
+  NET_PREFIX="$saved"
+  derive_network_values
+  NET_PREFIX_SOURCE="using previously assigned address from .network"
+  return 0
+fi
+if [ -n "$existing" ]; then
+  NET_PREFIX="$existing"
+  derive_network_values
+  write_network_prefix_file "$NET_PREFIX" || return 1
+  NET_PREFIX_SOURCE="using previously assigned address from existing libvirt network"
+  return 0
+fi
+NET_PREFIX="$(allocate_network_prefix)" || return 1
+echo "Allocated NET_PREFIX=$NET_PREFIX in $prefix_file" >&2
+derive_network_values
+NET_PREFIX_SOURCE="allocated new network address, pinned via .network"
+}
+
+validate_lab_prefix() {
+if [ -z "$LAB_PREFIX" ]; then
+  return 0
+fi
+if [[ ! "$LAB_PREFIX" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "LAB_PREFIX must start with a letter or digit and contain only letters, digits, dot, underscore, or dash: $LAB_PREFIX" >&2
+  return 1
+fi
+local bridge
+bridge="$(network_bridge_name)"
+if [ ${#bridge} -gt 15 ]; then
+  echo "LAB_PREFIX makes the libvirt bridge name too long: $bridge (${#bridge} chars, max 15)" >&2
+  echo "Shorten LAB_PREFIX or NET_NAME." >&2
+  return 1
+fi
+}
+
+lab_resource_name() {
+local name="$1"
+if [ -n "$LAB_PREFIX" ]; then
+  echo "${LAB_PREFIX}-${name}"
+else
+  echo "$name"
+fi
+}
+
+node_resource_name() {
+lab_resource_name "$1"
+}
+
+node_disk_name() {
+echo "$(node_resource_name "$1").qcow2"
+}
+
+node_seed_iso_name() {
+echo "$(node_resource_name "$1")-seed.iso"
+}
+
+network_resource_name() {
+lab_resource_name "$NET_NAME"
+}
+
+network_hook_chain_name() {
+local suffix="$1"
+echo "$(network_resource_name)-${suffix}"
+}
+
+validate_network_hook_chain_names() {
+local max=28
+local suffix chain
+for suffix in prerouting input forward; do
+  chain="$(network_hook_chain_name "$suffix")"
+  if [ ${#chain} -gt "$max" ]; then
+    echo "Network hook chain name too long: $chain (${#chain} chars, max $max)" >&2
+    echo "Shorten LAB_PREFIX or NET_NAME. Current network name: $(network_resource_name)" >&2
+    return 1
+  fi
+done
+}
+
+network_bridge_name() {
+local net_name bridge hash
+net_name="$(network_resource_name)"
+if [ -n "$LAB_PREFIX" ]; then
+  bridge="$net_name"
+else
+  bridge="virbr-${net_name}"
+fi
+if [ ${#bridge} -le 15 ]; then
+  echo "$bridge"
+  return 0
+fi
+hash="$(printf '%s' "$net_name" | sha1sum | awk '{print substr($1, 1, 8)}')"
+echo "virbr-${hash}"
+}
+
+sync_now_ts() {
+date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
+sync_clean_field() {
+local v="${1:-}"
+v="${v//$'\t'/ }"
+v="${v//$'\n'/ }"
+echo "${v:0:240}"
+}
+
+sync_write_meta() {
+local meta_file="$1"
+local node="$2"
+local src="$3"
+local dst="$4"
+local pid="$5"
+local last_sync="$6"
+local last_result="$7"
+local last_runtime="$8"
+local last_error="${9:-}"
+last_error="$(sync_clean_field "$last_error")"
+local tmp="${meta_file}.tmp.$$"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$node" "$src" "$dst" "$pid" "$last_sync" "$last_result" "$last_runtime" "$last_error" > "$tmp"
+mv "$tmp" "$meta_file"
+}
+
+sync_read_meta() {
+local meta_file="$1"
+IFS=$'\t' read -r SYNC_META_NODE SYNC_META_SRC SYNC_META_DST SYNC_META_PID SYNC_META_LAST_SYNC \
+  SYNC_META_LAST_RESULT SYNC_META_LAST_RUNTIME SYNC_META_LAST_ERROR < "$meta_file"
+}
+
+is_pid_alive() {
+local pid="$1"
+[ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1
+}
+
+sync_log_event() {
+local log_file="$1"
+local message="$2"
+printf '%s %s\n' "$(sync_now_ts)" "$message" >> "$log_file"
+}
+
+sync_daemon_loop() {
+local id="$1"
+local node="$2"
+local src="$3"
+local dst="$4"
+local pid="$BASHPID"
+local meta_file
+local log_file
+local event_file
+local ip
+local event_seq=0
+local inotify_pid=""
+local watch_fd=""
+meta_file="$(sync_meta_file "$id")"
+log_file="$(sync_log_file "$id")"
+event_file="$(sync_event_file "$id")"
+sync_daemon_cleanup() {
+  if [ -n "$watch_fd" ]; then
+    exec {watch_fd}<&-
+    watch_fd=""
+  fi
+  if [ -n "$inotify_pid" ] && is_pid_alive "$inotify_pid"; then
+    kill "$inotify_pid" >/dev/null 2>&1 || true
+    wait "$inotify_pid" >/dev/null 2>&1 || true
+  fi
+}
+trap 'sync_daemon_cleanup; exit 0' TERM INT EXIT
+sync_log_event "$log_file" "SYNC START node=$node src=$src dst=$dst pid=$pid"
+ip="$(node_ip "$node")"
+
+# Prepare destination once before entering the watch/sync loop.
+while true; do
+  if ssh "$BASE_USER@$ip" "sudo mkdir -p -- '$dst'" >/dev/null 2>&1; then
+    break
+  fi
+  sync_log_event "$log_file" "SYNC PREP RETRY node=$node dst=$dst"
+  sleep 2
+done
+
+touch "$event_file"
+sync_run_once() {
+  local reason="$1"
+  local ts sync_start_ns sync_end_ns elapsed_ns elapsed_ms elapsed_s elapsed_rem runtime rc out
+  ts="$(sync_now_ts)"
+  sync_start_ns="$(date +%s%N)"
+  if out="$(
+    rsync -az --delete --rsync-path="sudo rsync" "$src/" "$BASE_USER@$ip:$dst/"
+  2>&1
+  )"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  sync_end_ns="$(date +%s%N)"
+  elapsed_ns=$((sync_end_ns - sync_start_ns))
+  elapsed_ms=$(((elapsed_ns + 500000) / 1000000))
+  elapsed_s=$((elapsed_ms / 1000))
+  elapsed_rem=$((elapsed_ms % 1000))
+  runtime="$(printf '%d.%03ds' "$elapsed_s" "$elapsed_rem")"
+  if [ $rc -eq 0 ]; then
+    sync_log_event "$log_file" "SYNC OK node=$node src=$src dst=$dst runtime=$runtime reason=$reason"
+    sync_write_meta "$meta_file" "$node" "$src" "$dst" "$pid" "$ts" "ok" "$runtime" ""
+    return 0
+  else
+    sync_log_event "$log_file" "SYNC FAIL node=$node src=$src dst=$dst runtime=$runtime rc=$rc reason=$reason err=$(sync_clean_field "$out")"
+    sync_write_meta "$meta_file" "$node" "$src" "$dst" "$pid" "$ts" "fail" "$runtime" "$out"
+    return 1
+  fi
+}
+
+event_seq=1
+printf '%s\t%s\n' "$event_seq" "$(sync_now_ts)	BOOTSTRAP	initial-sync" >> "$event_file"
+if ! sync_run_once "bootstrap"; then
+  sleep 2
+fi
+
+while true; do
+  local ev_line
+  exec {watch_fd}< <(
+    inotifywait -m -q -r \
+      --format '%T\t%e\t%w%f' \
+      --timefmt '%Y-%m-%dT%H:%M:%SZ' \
+      -e create,modify,delete,move,attrib \
+      "$src" 2>>"$log_file"
+  )
+  inotify_pid="$!"
+  sync_log_event "$log_file" "SYNC WATCH START node=$node src=$src pid=$inotify_pid"
+  while IFS= read -r ev_line <&"$watch_fd"; do
+    event_seq=$((event_seq + 1))
+    printf '%s\t%s\n' "$event_seq" "$ev_line" >> "$event_file"
+    # keep reading events in short succession, only sync if there is
+    # a little silence, this combines multiple ops into one rsync
+    while IFS= read -t 0.3 -r ev_line; do
+      event_seq=$((event_seq + 1))
+      printf '%s\t%s\n' "$event_seq" "$ev_line" >> "$event_file"
+    done
+    if ! sync_run_once "event:$event_seq"; then
+      sleep 2
+    fi
+  done
+  exec {watch_fd}<&-
+  watch_fd=""
+  wait "$inotify_pid" >/dev/null 2>&1 || true
+  inotify_pid=""
+  sync_log_event "$log_file" "SYNC WATCH RESTART node=$node src=$src"
+  sleep 1
+done
+}
+
+start_sync_daemons() {
+local map_count="${#SYNC_DIRS_RESOLVED[@]}"
+if [ "$map_count" -eq 0 ]; then
+  echo "SYNC disabled: no SYNC_DIRS mappings configured."
+  return 0
+fi
+local dir
+dir="$(sync_state_dir)"
+mkdir -p "$dir"
+local started=0
+local already=0
+local node src dst id pid_file meta_file log_file pid
+for node in "${!NODES[@]}"; do
+  for src in "${!SYNC_DIRS_RESOLVED[@]}"; do
+    dst="${SYNC_DIRS_RESOLVED[$src]}"
+    id="$(sync_id "$node" "$src" "$dst")"
+    pid_file="$(sync_pid_file "$id")"
+    meta_file="$(sync_meta_file "$id")"
+    log_file="$(sync_log_file "$id")"
+    if [ -f "$pid_file" ]; then
+      pid="$(<"$pid_file")"
+      if is_pid_alive "$pid"; then
+        already=$((already + 1))
+        continue
+      fi
+      rm -f "$pid_file"
+    fi
+    (
+      trap '' HUP
+      sync_daemon_loop "$id" "$node" "$src" "$dst"
+    ) >>"$log_file" 2>&1 < /dev/null &
+    pid="$!"
+    echo "$pid" > "$pid_file"
+    sync_write_meta "$meta_file" "$node" "$src" "$dst" "$pid" "$(sync_now_ts)" "starting" "-" ""
+    started=$((started + 1))
+    echo "SYNC START node=$node src=$src dst=$dst pid=$pid"
+  done
+done
+echo "SYNC daemons: started=$started already_running=$already mappings=$map_count"
+}
+
+stop_sync_daemons() {
+local dir
+dir="$(sync_state_dir)"
+if [ ! -d "$dir" ]; then
+  return 0
+fi
+local pids=()
+local pid_files=()
+local pid_file pid
+shopt -s nullglob
+for pid_file in "$dir"/*.pid; do
+  pid="$(<"$pid_file")"
+  if is_pid_alive "$pid"; then
+    pids+=("$pid")
+    pid_files+=("$pid_file")
+  else
+    rm -f "$pid_file"
+  fi
+done
+shopt -u nullglob
+if [ ${#pids[@]} -eq 0 ]; then
+  return 0
+fi
+local p
+for p in "${pids[@]}"; do
+  kill "$p" >/dev/null 2>&1 || true
+done
+local deadline=$((SECONDS + 5))
+local pending=("${pids[@]}")
+while [ ${#pending[@]} -gt 0 ] && [ $SECONDS -lt $deadline ]; do
+  local still=()
+  for p in "${pending[@]}"; do
+    if is_pid_alive "$p"; then
+      still+=("$p")
+    fi
+  done
+  pending=("${still[@]}")
+  [ ${#pending[@]} -gt 0 ] && sleep 1
+done
+for p in "${pending[@]}"; do
+  kill -9 "$p" >/dev/null 2>&1 || true
+done
+local id meta_file log_file
+for pid_file in "${pid_files[@]}"; do
+  id="$(basename "$pid_file" .pid)"
+  meta_file="$(sync_meta_file "$id")"
+  log_file="$(sync_log_file "$id")"
+  if [ -f "$meta_file" ]; then
+    sync_read_meta "$meta_file" || true
+    sync_write_meta "$meta_file" "${SYNC_META_NODE:-?}" "${SYNC_META_SRC:-?}" "${SYNC_META_DST:-?}" \
+      "" "$(sync_now_ts)" "stopped" "${SYNC_META_LAST_RUNTIME:--}" ""
+  fi
+  if [ -f "$log_file" ]; then
+    sync_log_event "$log_file" "SYNC STOP"
+  fi
+  rm -f "$pid_file"
+done
+echo "SYNC daemons stopped: ${#pids[@]}"
+}
+
+sync_list() {
+local dir
+dir="$(sync_state_dir)"
+if [ ! -d "$dir" ]; then
+  echo "No active synchronizations."
+  return 0
+fi
+local printed=0
+local meta_file status
+shopt -s nullglob
+for meta_file in "$dir"/*.meta; do
+  sync_read_meta "$meta_file" || continue
+  status="stopped"
+  if is_pid_alive "${SYNC_META_PID:-}"; then
+    status="running"
+  elif [ -n "${SYNC_META_PID:-}" ]; then
+    status="stale"
+  fi
+  if [ "$status" != "running" ]; then
+    continue
+  fi
+  if [ "$printed" -eq 0 ]; then
+    printf 'NODE\tSRC\tDST\tPID\tSTATUS\tLAST_SYNC\tRUNTIME\n'
+  fi
+  printed=1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${SYNC_META_NODE:-}" "${SYNC_META_SRC:-}" "${SYNC_META_DST:-}" "${SYNC_META_PID:-}" \
+    "$status" "${SYNC_META_LAST_SYNC:-}" "${SYNC_META_LAST_RUNTIME:-}"
+done
+shopt -u nullglob
+if [ "$printed" -eq 0 ]; then
+  echo "No active synchronizations."
+fi
+}
+
+sync_log() {
+local follow=0
+local lines=50
+OPTIND=1
+while getopts ":fn:" opt; do
+  case "$opt" in
+    f) follow=1 ;;
+    n)
+      if ! [[ "$OPTARG" =~ ^[0-9]+$ ]] || [ "$OPTARG" -lt 1 ]; then
+        echo "sync-log: -n expects a positive integer" >&2
+        return 1
+      fi
+      lines="$OPTARG"
+      ;;
+    *)
+      echo "Usage: sync-log [-f] [-n lines]" >&2
+      return 1
+      ;;
+  esac
+done
+shift $((OPTIND - 1))
+if [ "$#" -ne 0 ]; then
+  echo "Usage: sync-log [-f] [-n lines]" >&2
+  return 1
+fi
+local dir
+dir="$(sync_state_dir)"
+if [ ! -d "$dir" ]; then
+  echo "No sync logs found."
+  return 0
+fi
+local logs=()
+local f
+shopt -s nullglob
+for f in "$dir"/*.log; do
+  logs+=("$f")
+done
+shopt -u nullglob
+if [ ${#logs[@]} -eq 0 ]; then
+  echo "No sync logs found."
+  return 0
+fi
+if [ "$follow" -eq 1 ]; then
+  tail -n "$lines" -F "${logs[@]}"
+else
+  tail -n "$lines" -v "${logs[@]}"
+fi
+}
+
+node_ip() {
+  # Usage: wknum cp1 | wk7
+  local name="${1}"
+  [[ -z $name ]] && { echo "Usage: node_ip cpN|wkN" >&2; return 1; }
+
+  local mem vcpus role opts ip_override
+  opts=""
+  ip_override=""
+  read -r mem vcpus role opts <<<"${NODES[$name]}"
+  local opt
+  if [ -n "$opts" ]; then
+    IFS=',' read -r -a opt <<<"$opts"
+    local o
+    for o in "${opt[@]}"; do
+      case "$o" in
+        ip=*)
+          ip_override="${o#ip=}"
+          ;;
+      esac
+    done
+  fi
+
+  if [ -n "$ip_override" ]; then
+    if [[ "$ip_override" == *.* ]]; then
+      if [[ "$ip_override" != "$NET_PREFIX".* ]]; then
+        echo "Warning: $name ip=$ip_override does not match NET_PREFIX=$NET_PREFIX" >&2
+      fi
+      echo "$ip_override"
+      return 0
+    fi
+    echo "${NET_PREFIX}.${ip_override}"
+    return 0
+  fi
+
+  if [[ $name =~ ^([A-Za-z]+)([0-9]+)$ ]]; then
+    local pre="${BASH_REMATCH[1],,}" # lowercase prefix
+    local n="${BASH_REMATCH[2]}"
+    case "$pre" in
+      cp) echo "${NET_PREFIX}.$((10 + 10#$n))" ;;
+      wk) echo "${NET_PREFIX}.$((20 + 10#$n))" ;;
+      *)  echo "Unsupported prefix: $pre" >&2; return 2 ;;
+    esac
+  else
+    echo "$name: Assign an IP or name it cpN, wkN" >&2
+    return 2
+  fi
+}
+
+# defined roles: seed, cp (not used yet), wk, none (not used)
+node_role() {
+  local name="$1"
+  local role
+  read -r _ _ role _ <<<"${NODES[$name]}"
+  echo "$role"
+}
+
+seed_node() {
+  local seeds=()
+  local n
+  for n in "${!NODES[@]}"; do
+    if [ "$(node_role "$n")" = "seed" ]; then
+      seeds+=("$n")
+    fi
+  done
+  if [ ${#seeds[@]} -ne 1 ]; then
+    echo "Expected exactly one seed node, found ${#seeds[@]}" >&2
+    return 1
+  fi
+  echo "${seeds[0]}"
+}
+
+ips() {
+for n in "${!NODES[@]}"; do
+  echo $( node_ip $n)
+done
+}
+
+var() {
+eval "echo \$$1";
+}
+
+keyPath() {
+echo "$SSH_PUBKEY_PATH"
+}
+
+check() {
+  declare -A cmd_pkg=(
+    [virsh]="libvirt-clients"
+    [virt-install]="virtinst"
+    [qemu-img]="qemu-utils"
+    [cloud-localds]="cloud-image-utils"
+    [virt-cat]="libguestfs-tools"
+    [curl]="curl"
+    [ip]="iproute2"
+    [nc]="netcat-openbsd"
+    [ping]="iputils-ping"
+    [ssh]="openssh-client"
+    [scp]="openssh-client"
+    [ssh-keygen]="openssh-client"
+    [ssh-keyscan]="openssh-client"
+    [rsync]="rsync"
+    [inotifywait]="inotify-tools"
+    [awk]="gawk"
+    [flock]="util-linux"
+    [sha1sum]="coreutils"
+    [mktemp]="coreutils"
+    [stat]="coreutils"
+    [shuf]="coreutils"
+    [sort]="coreutils"
+    [uniq]="coreutils"
+    [paste]="coreutils"
+    [sed]="sed"
+    [growpart]="cloud-guest-utils"
+  )
+
+  local required_pkgs=(
+    qemu-system-x86
+    libvirt-daemon-system
+    libvirt-clients
+    virtinst
+    bridge-utils
+  )
+
+  local missing_cmds=()
+  local missing_pkgs=()
+  local cmd pkg
+
+  for cmd in "${!cmd_pkg[@]}"; do
+    if ! command -v "$cmd" >/dev/null; then
+      missing_cmds+=("$cmd")
+      pkg="${cmd_pkg[$cmd]}"
+      missing_pkgs+=("$pkg")
+    fi
+  done
+
+  local p
+  for p in "${required_pkgs[@]}"; do
+    if ! dpkg -s "$p" >/dev/null 2>&1; then
+      missing_pkgs+=("$p")
+    fi
+  done
+
+  if [ ${#missing_cmds[@]} -gt 0 ] || [ ${#missing_pkgs[@]} -gt 0 ]; then
+    if [ ${#missing_cmds[@]} -gt 0 ]; then
+      echo "Missing commands:"
+      printf '  %s\n' "${missing_cmds[@]}" | sort -u
+    fi
+    local pkg_line
+    pkg_line="$(printf '%s\n' "${missing_pkgs[@]}" | sort -u | tr '\n' ' ' | sed -e 's/[[:space:]]\+/ /g' -e 's/[[:space:]]$//')"
+    echo "Suggested Debian packages to install:"
+    echo "  sudo apt-get update && sudo apt-get install -y ${pkg_line}"
+    return 1
+  fi
+
+  # Verify we can actually talk to libvirt — packages can be present while the
+  # user still lacks access to the socket (not in the libvirt group).
+  if command -v virsh >/dev/null; then
+    local lv_err
+    if ! lv_err="$(virsh -c "$LIBVIRT_DEFAULT_URI" version 2>&1)"; then
+      echo "Cannot connect to libvirt at $LIBVIRT_DEFAULT_URI:" >&2
+      printf '  %s\n' "$lv_err" >&2
+      if printf '%s' "$lv_err" | grep -qiE 'permission denied|failed to connect'; then
+        echo "Your user likely needs to be in the 'libvirt' group:" >&2
+        echo "  sudo usermod -aG libvirt $USER" >&2
+        echo "Then log out and back in (or run: newgrp libvirt)." >&2
+      fi
+      return 1
+    fi
+  fi
+
+  echo "All required commands are available and packages installed."
+  return 0
+}
+
+start_storage() {
+echo "Start storage pool..."
+local pool_target="/var/lib/libvirt/images"
+if ! virsh pool-info "$POOL" >/dev/null 2>&1; then
+  echo "Defining storage pool $POOL at $pool_target"
+  mkdir -p "$pool_target"
+  virsh pool-define-as "$POOL" dir --target "$pool_target"
+  virsh pool-build "$POOL" >/dev/null 2>&1 || true
+fi
+virsh pool-start "$POOL"  >/dev/null 2>&1 || true
+virsh pool-autostart "$POOL" || true
+}
+
+install_interceptor_network_hook() {
+test -f $PROXY_BUMP_CA_CRT || {
+  echo "Skip HTTP/HTTPS interceptor..."
+  return 0
+}
+local hook_path="/etc/libvirt/hooks/network"
+local hook_script=$BASE_DIR/share/libvirt-network-hook.sh
+if [ -r "$hook_path" ] && cmp -s "$hook_script" "$hook_path"; then
+  echo "Interceptor network hook at $hook_path is already up to date; skipping."
+  return 0
+fi
+echo "Need to sudo to install the squid interceptor network hook that manages iptables rules"
+sudo install -D -m 0755 "$hook_script" "$hook_path"
+}
+
+install_iptables_hook() {
+local dest=/etc/libvirt/hooks/qemu
+if [ ! -w "$(dirname "$dest")" ] && [ ! -w "$dest" ]; then
+  echo "Warning: cannot write $dest (insufficient permissions). Skipping iptables hook install." >&2
+  return 0
+fi
+cat > $dest.bak <<"EOF"
+#!/bin/bash
+
+# Automatically installed by kubevm
+
+# By default the virsh bridge rejects traffic from other interfaces
+# establish firewall rules
+
+set -e
+
+provideEmptyPreroutingChain() {
+local chain="$1"
+iptables -t nat -N "$chain" 2>/dev/null || true
+iptables -t nat -F "$chain"
+iptables -t nat -C PREROUTING -j "$chain" 2>/dev/null|| iptables -t nat -A PREROUTING -j "$chain"
+}
+
+provideEmptyForwardChain() {
+local chain="$1"
+iptables -N "$chain" 2>/dev/null || true
+iptables -F "$chain"
+iptables -C FORWARD -j "$chain" 2>/dev/null || iptables -I FORWARD 1 -j "$chain"
+}
+
+export DOMAIN="$1"
+export PREROUTING_CHAIN=libvirt-h7e-$DOMAIN
+export FORWARD_CHAIN=libvirt-h7e-$DOMAIN
+export DOMAIN_SCRIPT=/etc/libvirt/h7e-domain-iptables/$DOMAIN.sh
+
+if [ "$2" = "started" ]; then
+  provideEmptyPreroutingChain "$PREROUTING_CHAIN"
+  provideEmptyForwardChain "$FORWARD_CHAIN"
+  test -f "$DOMAIN_SCRIPT" && bash "$DOMAIN_SCRIPT" "$PREROUTING_CHAIN" "$FORWARD_CHAIN"
+  # 6443: api server
+  # 18080: ingress
+#  for PORT in 6443 18080; do
+#    iptables -t nat -A "$PR_CHAIN" -i tun0 -p tcp --dport $PORT  -j DNAT --to-destination 192.168.123.11:$PORT
+#    iptables -A "$FORWARD_CHAIN" -i tun0 -o virbr-dev -d 192.168.123.11 -p tcp --dport $PORT -m conntrack --ctstate NEW -j ACCEPT
+#    iptables -A "$FORWARD_CHAIN" -i virbr-dev -o tun0 -p tcp -s 192.168.123.11 --sport $PORT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+#  done
+fi
+# just flush chains and keep it empty
+if [ "$2" = "stopped" ]; then
+  provideEmptyPreroutingChain $PREROUTING_CHAIN
+  provideEmptyForwardChain "$FORWARD_CHAIN"
+fi
+EOF
+if test -f $dest && cmp --quiet $dest $dest.bak; then
+  rm -f $dest.bak
+  return
+fi
+mv $dest.bak $dest
+chmod o+rx $dest
+# libvirtd needs to be restarted for the hook to take effect
+if ! systemctl restart libvirtd; then
+  echo "Warning: failed to restart libvirtd; iptables hook may not be active." >&2
+fi
+}
+
+# https://download.libvirt.org/virshcmdref/html/sect-net-define.html
+# https://libvirt.org/formatnetwork.html
+write_network_xml() {
+local dest="$1"
+local net_name bridge_name
+net_name="$(network_resource_name)"
+bridge_name="$(network_bridge_name)"
+cat >"$dest" <<EOF
+<network>
+  <name>${net_name}</name>
+  <forward mode='nat'/>
+  <domain name='${NET_DOMAIN}'/>
+  <bridge name='${bridge_name}' stp='on' delay='0'/>
+  <ip address='${NET_ADDR}' netmask='${NET_MASK}'>
+    <dhcp>
+      <range start='${DHCP_START}' end='${DHCP_END}'/>
+    </dhcp>
+  </ip>
+</network>
+EOF
+}
+
+network_xml_attr() {
+local xml="$1"
+local element="$2"
+local attr="$3"
+printf '%s\n' "$xml" | sed -n "s/.*<${element}[^>]*[[:space:]]${attr}=['\"]\([^'\"]*\)['\"].*/\1/p" | head -n1
+}
+
+network_xml_check_attr() {
+local xml="$1"
+local element="$2"
+local attr="$3"
+local expected="$4"
+local label="$5"
+local actual
+actual="$(network_xml_attr "$xml" "$element" "$attr")"
+if [ "$actual" != "$expected" ]; then
+  echo "  $label: expected '$expected', found '${actual:-<missing>}'" >&2
+  return 1
+fi
+}
+
+network_xml_matches_expected() {
+local xml="$1"
+local ok=0
+network_xml_check_attr "$xml" bridge name "$(network_bridge_name)" "bridge name" || ok=1
+network_xml_check_attr "$xml" domain name "$NET_DOMAIN" "domain name" || ok=1
+network_xml_check_attr "$xml" ip address "$NET_ADDR" "gateway address" || ok=1
+network_xml_check_attr "$xml" ip netmask "$NET_MASK" "netmask" || ok=1
+network_xml_check_attr "$xml" range start "$DHCP_START" "DHCP start" || ok=1
+network_xml_check_attr "$xml" range end "$DHCP_END" "DHCP end" || ok=1
+return "$ok"
+}
+
+network_info_field() {
+local net_name="$1"
+local field="$2"
+virsh net-info "$net_name" 2>/dev/null | awk -F: -v field="$field" '
+  $1 == field {
+    gsub(/^[ \t]+|[ \t]+$/, "", $2)
+    print $2
+    exit
+  }
+'
+}
+
+start_network() {
+local net_name active xml tmpnet action
+net_name="$(network_resource_name)"
+if ! virsh net-info "$net_name" >/dev/null 2>&1; then
+  check_network_prefix_not_in_host_use || return 1
+  echo "Defining network $net_name"
+  tmpnet="$(mktemp)"
+  write_network_xml "$tmpnet"
+  virsh net-define "$tmpnet"
+  rm -f "$tmpnet"
+  action=created
+else
+  xml="$(virsh net-dumpxml "$net_name")" || return 1
+  if ! network_xml_matches_expected "$xml"; then
+    echo "Existing libvirt network $net_name does not match this lab config." >&2
+    echo "Run lab purge for this lab, or remove the stale network with virsh after confirming it is unused." >&2
+    return 1
+  fi
+fi
+install_interceptor_network_hook
+active="$(network_info_field "$net_name" Active || true)"
+case "$active" in
+  yes)
+    action="${action:-already active}"
+    ;;
+  no)
+    check_network_prefix_not_in_host_use || return 1
+    virsh net-start "$net_name"
+    action="${action:-started}"
+    ;;
+  *)
+    echo "Unable to determine libvirt network state for $net_name" >&2
+    return 1
+    ;;
+esac
+echo "Network $net_name $action with address ${NET_ADDR}/${NET_PREFIX_LEN} (${NET_PREFIX_SOURCE:-using current lab config})."
+virsh net-autostart "$net_name"
+# install_iptables_hook
+if declare -F after_start_network >/dev/null; then
+  after_start_network
+fi
+}
+
+# download the image for qemu
+# if there is a customize script, run it with in the image context
+# to do some package installs and updates. this way we don't
+# need to download packages in each node again
+# Ensure the base cloud image exists as a libvirt **volume**
+#(no writes to /var/lib/libvirt/images directly)
+create_base_volume() {
+if ! virsh vol-info --pool "$POOL" "$FINAL_VOL" >/dev/null 2>&1; then
+  echo "[*] Fetching base image and uploading into pool volume: $FINAL_VOL"
+  local tmp=$DOWNLOAD_DIR/$BASE_VOL
+  test -f $tmp || curl -L "$BASE_URL" -o "$tmp"
+  local script=$BASE_DIR/node-setup/$NODE_SETUP/customize-image.sh
+  if test -f $script; then
+    test -f "$tmp-custom" || {
+      echo "Image customization requires sudo..."
+      # export relevant variables
+      export KUBE_VERSION
+      sudo $BASE_DIR/lib/run-customize-image.sh "$tmp" "$tmp-$NODE_SETUP" $script
+    }
+    tmp="$tmp-$NODE_SETUP"
+  fi
+  sz=$(stat -c%s "$tmp")
+  virsh vol-create-as "$POOL" "$FINAL_VOL" "$sz" --format qcow2
+  virsh vol-upload --pool "$POOL" "$FINAL_VOL" "$tmp"
+  # --length "$sz"
+else
+  echo "[*] Base volume already present: $FINAL_VOL"
+fi
+}
+
+purge_base_volume() {
+virsh vol-delete --pool "$POOL" "$FINAL_VOL"
+}
+
+# Helpers: create thin overlay + per-VM cloud-init ISO (both as pool volumes)
+create_overlay() {
+  local name="$1"
+  local vol_name
+  vol_name="$(node_disk_name "$name")"
+  virsh vol-info --pool "$POOL" "$vol_name" >/dev/null 2>&1 && return
+  BASE_PATH="$(virsh vol-path --pool "$POOL" "$FINAL_VOL")"
+  echo "  - creating overlay: ${vol_name} (backing ${BASE_PATH})"
+  tmpxml="$(mktemp)"
+  cat >"$tmpxml" <<EOF
+<volume type='file'>
+  <name>${vol_name}</name>
+  <capacity unit='G'>${DISK_G}</capacity>
+  <target><format type='qcow2'/><compat>1.1</compat></target>
+  <backingStore>
+    <path>${BASE_PATH}</path>
+    <format type='qcow2'/>
+  </backingStore>
+</volume>
+EOF
+  virsh vol-create "$POOL" "$tmpxml"
+  rm -f "$tmpxml"
+}
+
+# cloud-init clud-config
+create_seed_iso() {
+  local name="$1"
+  local iso
+  iso="$(node_seed_iso_name "$name")"
+  virsh vol-info --pool "$POOL" "$iso" >/dev/null 2>&1 && return
+  echo "  - creating seed ISO: $iso"
+  d="$(mktemp -d)"
+  cat >"$d/user-data" <<EOF
+#cloud-config
+ssh_pwauth: false
+users:
+  - name: ubuntu
+    groups: sudo
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    shell: /bin/bash
+    $( [[ -n "$SSH_PUBKEY" ]] && echo "ssh_authorized_keys: [ ${SSH_PUBKEY@Q} ]" )
+    lock_passwd: false
+chpasswd:
+  expire: false
+  users:
+    - name: ubuntu
+      password: changeme
+      type: text
+# switch off package update, this is otherwise colliding with execution of
+# our install scripts
+package_update: false
+runcmd:
+  - swapoff -a
+  - sed -ri '/\\sswap\\s/s/^/#/' /etc/fstab
+EOF
+# https://cloudinit.readthedocs.io/en/latest/reference/network-config-format-v2.html
+cat >"$d/network-config" <<EOF
+network:
+  version: 2
+  ethernets:
+    # opaque ID for physical interfaces, only referred to by other stanzas
+    nic0:
+      match: { name: "en*" }   # matches ens3/enp1s0
+      addresses: [ "$(node_ip $name)/$NET_PREFIX_LEN" ]
+      gateway4: ${NET_PREFIX}.1
+      nameservers: { addresses: [ ${NET_PREFIX}.1 ] }
+      dhcp4: false
+      dhcp6: false
+EOF
+# cat "$d/network-config"
+  cloud-localds --hostname "$name" "$d/$iso" "$d/user-data" --network-config "$d/network-config"
+  sz=$(stat -c%s "$d/$iso")
+  virsh vol-create-as "$POOL" "$iso" "$sz" --format raw
+  virsh vol-upload    --pool "$POOL" "$iso" "$d/$iso" --length "$sz"
+  rm -rf "$d"
+}
+
+ensure_vm() {
+  local name="$1"
+  local mem="$2"
+  local vcpus="$3"
+  local vm_name net_name disk_name iso_name serial_log
+  vm_name="$(node_resource_name "$name")"
+  net_name="$(network_resource_name)"
+  disk_name="$(node_disk_name "$name")"
+  iso_name="$(node_seed_iso_name "$name")"
+  serial_log="/var/log/libvirt/qemu/${vm_name}-serial0.log"
+  if virsh dominfo "$vm_name" >/dev/null 2>&1; then
+    echo "  - VM ${vm_name} already defined"
+  else
+    echo "  - defining VM ${vm_name}"
+    virt-install \
+      --name "$vm_name" \
+      --memory "$mem" --vcpus "$vcpus" \
+      --os-variant "$OSVAR" \
+      --import \
+      --network network="$net_name",model=virtio \
+      --disk vol="$POOL/${disk_name}",bus=virtio,discard=unmap \
+      --disk vol="$POOL/${iso_name}",device=cdrom,readonly=on \
+      --graphics none \
+      --serial pty \
+      --xml xpath.create=./devices/serial[1]/log \
+      --xml xpath.set=./devices/serial[1]/log/@file="$serial_log" \
+      --noautoconsole
+  fi
+  virsh start "$vm_name" >/dev/null 2>&1 || true
+}
+
+create_node() {
+  local name="$1"
+  local mem="$2"
+  local vcpus="$3"
+  create_overlay "$name"
+  create_seed_iso "$name"
+  ensure_vm "$name" "$mem" "$vcpus"
+}
+
+#start_storage
+#start_network
+#create_base_volume
+
+test_single_node() {
+create_overlay cp1
+create_seed_iso cp1
+ensure_vm cp1 4096 2
+SADJASD
+}
+
+create_all_nodes() {
+echo "[*] Creating overlays, seed ISOs, and VMs…"
+for n in "${!NODES[@]}"; do
+  read -r mem vcpus _ _ <<<"${NODES[$n]}"
+  echo "  -> $n"
+  create_node "$n" "$mem" "$vcpus"
+done
+}
+
+wait_for_ping() {
+local secs=100
+echo -n "Waiting ${secs} seconds for IPs to become reachable..."
+local nodelist="$(for n in "${!NODES[@]}"; do echo $n; done)"
+while test -n "$nodelist"; do
+  node=$(echo "$nodelist" | shuf | head -n1)
+  ip=$(node_ip $node)
+  if ping -c 1 -W 1 "$ip" > /dev/null 2>&1; then
+    echo ""
+    echo -n "$node $ip reachable"
+    # remove node from list
+    nodelist="$((echo "$nodelist"; echo "$node") | sort | uniq -u)"
+  else
+    echo -n "."
+  fi
+  if [ $((secs--)) -eq 0 ]; then
+    echo "Aborted, missing: $(echo "$nodelist" | paste -sd, -)"
+    return 1;
+  fi
+done
+echo ""
+echo "Complete!"
+}
+
+wait_for_ssh() {
+local secs=100
+echo -n "Waiting ${secs} seconds for ssh to become reachable..."
+local nodelist="$(for n in "${!NODES[@]}"; do echo $n; done)"
+while test -n "$nodelist"; do
+  node=$(echo "$nodelist" | shuf | head -n1)
+  ip=$(node_ip $node)
+  if nc -zv -w 1 $ip 22 > /dev/null 2>&1; then
+    echo ""
+    echo -n "$node $ip reachable"
+    # remove node from list
+    nodelist="$((echo "$nodelist"; echo "$node") | sort | uniq -u)"
+  else
+    # timeout has no effect since connection is rejected instantly
+    # when network stack is up. maybe we can differentiate via return code?
+    sleep 1
+    echo -n "."
+  fi
+  if [ $((secs--)) -eq 0 ]; then
+    echo "Aborted, missing: $(echo "$nodelist" | paste -sd, -)"
+    return 1;
+  fi
+done
+echo ""
+echo "Complete!"
+}
+
+# use ssh-keyscan to add the ssh public key id. this is safe within the local computer.
+# alternatively use virt-cat or qemu-guest-agent, https://chatgpt.com/c/68d8ecb3-2688-8333-ba5c-5f1765821da7
+# or in .ssh/config do: Host 192.168.122.* UserKnownHostsFile=/dev/null
+# for k0sctrl, you can also do env SSH_KNOWN_HOSTS=/dev/null
+# https://github.com/k0sproject/k0sctl/issues/445#issuecomment-1378680320
+add_ssh_key() {
+local ip="$1"
+local known_hosts="$HOME/.ssh/known_hosts"
+mkdir -p "$(dirname "$known_hosts")"
+touch "$known_hosts"
+ssh-keygen -R "$ip" -f "$known_hosts"
+# default is 5 secs timeout
+ssh-keyscan -T 15 -t ed25519 -H "$ip" >> "$known_hosts"
+}
+
+add_all_ssh_node_keys() {
+echo "Adding ssh keys from nodes to ~/.ssh/known_hosts (via ssh-keyscan)"
+for ip in $(ips); do
+  add_ssh_key "$ip"
+done
+}
+
+# add the proxy ca to speed up downloads
+add_proxy_ca_cert() {
+test -f $PROXY_BUMP_CA_CRT || {
+  echo "Skip installing interceptor cert..."
+  return 0
+}
+local ip="$1"
+scp "$PROXY_BUMP_CA_CRT" "$BASE_USER@$ip":ssl-bump-ca.crt
+ssh "$BASE_USER@$1" sudo mv ssl-bump-ca.crt /usr/local/share/ca-certificates/
+ssh "$BASE_USER@$1" sudo update-ca-certificates
+}
+
+add_all_proxy_ca_certs() {
+if ! test -f "$PROXY_BUMP_CA_CRT"; then
+  echo "No proxy bump ca cert at $PROXY_BUMP_CA_CRT, skipping..."
+  return;
+fi
+echo "Add proxy ca certs"
+for ip in $(ips); do
+  add_proxy_ca_cert $ip
+done
+}
+
+join_cmd() {
+local seed
+seed="$(seed_node)" || return 1
+echo "Fetch kubeadm join command from $seed" >&2
+ssh "$BASE_USER@$(node_ip "$seed")" 'sudo kubeadm token create --print-join-command'
+}
+
+
+
+join_workers() {
+echo "Join worker nodes to the cluster"
+local join
+join="$(join_cmd)"
+local workers=()
+local n
+for n in "${!NODES[@]}"; do
+  if [ "$(node_role "$n")" = "wk" ]; then
+    workers+=("$n")
+  fi
+done
+if [ ${#workers[@]} -eq 0 ]; then
+  echo "No worker nodes found"
+  return 0
+fi
+local tmpdir script
+tmpdir="$(mktemp -d /tmp/kube-join-workers.XXXXXX)"
+script="$tmpdir/10-join-workers.sh"
+cat > "$script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+$join
+EOF
+chmod +x "$script"
+local rc=0
+if ! run_scripts_on_nodes "$tmpdir" "${workers[@]}"; then
+  rc=$?
+fi
+rm -rf "$tmpdir"
+return "$rc"
+}
+
+join_additional_cp_nodes() {
+echo "Join additional control-plane nodes to the cluster"
+local seed
+seed="$(seed_node)" || return 1
+local cert_key
+cert_key="$(ssh "$BASE_USER@$(node_ip "$seed")" 'sudo kubeadm init phase upload-certs --upload-certs | tail -n1')"
+local join
+join="$(ssh "$BASE_USER@$(node_ip "$seed")" "sudo kubeadm token create --print-join-command --certificate-key $cert_key --control-plane")"
+local n
+local found=0
+for n in "${!NODES[@]}"; do
+  if [ "$(node_role "$n")" = "cp" ]; then
+    found=1
+    (
+      echo "  -> $n"
+      ssh "$BASE_USER@$(node_ip "$n")" 'sudo bash -s' <<<"$join"
+    ) &
+  fi
+done
+if [ $found -eq 0 ]; then
+  echo "No additional control-plane nodes found"
+  return 0
+fi
+wait
+}
+
+run_scripts_on_nodes() {
+  local script_dir="$1"
+  shift
+  local nodes=("$@")
+  local scripts=()
+  local all_fifos=()
+  local keepalive_fds=()
+  local pids=()
+  local mux_meta mux_pid
+  local s n stream fifo key
+  declare -A fifo_map=()
+  # That’s to safely quote the value before embedding it into the remote ssh command string. printf -v ... "%q" turns the value into a shell-escaped form,
+  # so if KUBE_VERSION is empty or contains odd characters, it won’t break the command or allow injection.
+
+  local kube_version_q
+  printf -v kube_version_q "%q" "${KUBE_VERSION:-}"
+
+  if [ ! -d "$script_dir" ]; then
+    echo "No $(basename "$script_dir") scripts found"
+    return 0
+  fi
+
+  for s in "$script_dir"/*.sh; do
+    scripts+=("$s")
+  done
+
+  if [ ${#scripts[@]} -eq 0 ]; then
+    echo "No $(basename "$script_dir") scripts found"
+    return 0
+  fi
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "python3 is required for output mux in run_scripts_on_nodes" >&2
+    return 1
+  fi
+
+  mux_meta="$(mktemp /tmp/kube-run-scripts-mux-meta.XXXXXX)"
+  for n in "${nodes[@]}"; do
+    for s in "${scripts[@]}"; do
+      local script_name
+      script_name="$(basename "$s")"
+      for stream in OUT ERR INFO; do
+        key="$n|$script_name|$stream"
+        fifo="$(mktemp -u)"
+        mkfifo "$fifo"
+        fifo_map["$key"]="$fifo"
+        all_fifos+=("$fifo")
+        printf '%s\t%s\t%s\t%s\n' "$fifo" "$n" "$script_name" "$stream" >> "$mux_meta"
+      done
+    done
+  done
+
+  python3 -u - "$mux_meta" <<'PY' &
+import datetime
+import os
+import selectors
+import sys
+
+meta_path = sys.argv[1]
+entries = []
+with open(meta_path, encoding="utf-8") as f:
+    for raw in f:
+        raw = raw.rstrip("\n")
+        if not raw:
+            continue
+        fifo, host, script, stream = raw.split("\t")
+        entries.append((fifo, host, script, stream))
+
+sel = selectors.DefaultSelector()
+buf = {}
+meta = {}
+
+for fifo, host, script, stream in entries:
+    fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    sel.register(fd, selectors.EVENT_READ)
+    buf[fd] = bytearray()
+    meta[fd] = (host, script, stream)
+
+def ts():
+    return datetime.datetime.now(datetime.timezone.utc).astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
+
+while meta:
+    events = sel.select(timeout=1.0)
+    if not events:
+        continue
+    for key, _ in events:
+        fd = key.fd
+        try:
+            data = os.read(fd, 65536)
+        except BlockingIOError:
+            continue
+        if data:
+            b = buf[fd]
+            b.extend(data)
+            while True:
+                nl = b.find(b"\n")
+                if nl < 0:
+                    break
+                line = bytes(b[:nl])
+                del b[: nl + 1]
+                line = line.replace(b"\r", b"")
+                host, script, stream = meta[fd]
+                msg = line.decode("utf-8", "replace")
+                sys.stdout.write(f"{ts()} {host} {script} {stream} {msg}\n")
+                sys.stdout.flush()
+        else:
+            rem = bytes(buf[fd]).replace(b"\r", b"")
+            if rem:
+                host, script, stream = meta[fd]
+                msg = rem.decode("utf-8", "replace")
+                sys.stdout.write(f"{ts()} {host} {script} {stream} {msg}\n")
+                sys.stdout.flush()
+            sel.unregister(fd)
+            os.close(fd)
+            del buf[fd]
+            del meta[fd]
+PY
+  mux_pid=$!
+
+  for fifo in "${all_fifos[@]}"; do
+    local fd
+    exec {fd}> "$fifo"
+    keepalive_fds+=("$fd")
+  done
+
+  for n in "${nodes[@]}"; do
+    local ip
+    ip="$(node_ip "$n")"
+    (
+      for s in "${scripts[@]}"; do
+        local script_name
+        local out_fifo err_fifo info_fifo start_ns end_ns elapsed_ns elapsed_tenths elapsed_s elapsed_d
+        script_name="$(basename "$s")"
+        key="$n|$script_name|OUT"
+        out_fifo="${fifo_map[$key]}"
+        key="$n|$script_name|ERR"
+        err_fifo="${fifo_map[$key]}"
+        key="$n|$script_name|INFO"
+        info_fifo="${fifo_map[$key]}"
+        printf 'START\n' > "$info_fifo"
+        start_ns="$(date +%s%N)"
+        ssh "$BASE_USER@$ip" "KUBE_VERSION=$kube_version_q tmp=\$(mktemp /tmp/kube-XXXXXX.sh); cat > \"\$tmp\"; sudo KUBE_VERSION=$kube_version_q bash \"\$tmp\"; rc=\$?; rm -f \"\$tmp\"; exit \$rc" < "$s" \
+          1> "$out_fifo" \
+          2> "$err_fifo"
+        local rc=$?
+        end_ns="$(date +%s%N)"
+        elapsed_ns=$((end_ns - start_ns))
+        elapsed_tenths=$(((elapsed_ns + 50000000) / 100000000))
+        elapsed_s=$((elapsed_tenths / 10))
+        elapsed_d=$((elapsed_tenths % 10))
+        if [ $rc -ne 0 ]; then
+          printf 'FAIL rc=%s\n' "$rc" > "$info_fifo"
+          exit "$rc"
+        fi
+        printf 'DONE runtime=%s.%ss\n' "$elapsed_s" "$elapsed_d" > "$info_fifo"
+      done
+    ) &
+    pids+=("$!")
+  done
+  local failed=0
+  local pid
+  for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+      failed=1
+    fi
+  done
+
+  local fd
+  for fd in "${keepalive_fds[@]}"; do
+    exec {fd}>&-
+  done
+
+  wait "$mux_pid"
+
+  rm -f "$mux_meta"
+  rm -f "${all_fifos[@]}"
+
+  if [ $failed -ne 0 ]; then
+    return 1
+  fi
+}
+
+run_node_setup() {
+  test -n "$NODE_SETUP" || return
+  echo "Run $NODE_SETUP node setup scripts on all nodes"
+  local nodes=()
+  local n
+  for n in "${!NODES[@]}"; do
+    nodes+=("$n")
+  done
+  run_scripts_on_nodes "$BASE_DIR/node-setup/$NODE_SETUP/scripts.d" "${nodes[@]}"
+}
+
+run_seed_setup() {
+  echo "Run $SEED_SETUP setup scripts on seed node"
+  local seeds=()
+  local n
+  for n in "${!NODES[@]}"; do
+    if [ "$(node_role "$n")" = "seed" ]; then
+      seeds+=("$n")
+    fi
+  done
+  if [ ${#seeds[@]} -ne 1 ]; then
+    echo "Expected exactly one seed node, found ${#seeds[@]}" >&2
+    return 1
+  fi
+  run_scripts_on_nodes "$BASE_DIR/seed-setup/$SEED_SETUP/scripts.d" "${seeds[0]}"
+  # run_scripts_on_nodes "$CLUSTER_DIR/seed.d" "${seeds[0]}"
+}
+
+update_node() {
+echo update node $1
+(
+ssh "$BASE_USER@$1" 'cat > update.sh' <<EOF
+apt-get update
+apt-get upgrade -y
+apt-get install joe
+EOF
+ssh "$BASE_USER@$1" 'sudo bash update.sh'
+) 2>&1 | awk "{print \"$1: \"\$0}"
+}
+
+purge_node() {
+local n="$1"
+local vm_name disk_name iso_name
+vm_name="$(node_resource_name "$n")"
+disk_name="$(node_disk_name "$n")"
+iso_name="$(node_seed_iso_name "$n")"
+virsh destroy "$vm_name" || true
+virsh undefine "$vm_name" || true
+virsh vol-delete --pool "$POOL" "$disk_name" || true
+virsh vol-delete --pool "$POOL" "$iso_name" || true
+}
+
+purge_all_nodes() {
+for n in "${!NODES[@]}"; do
+  purge_node $n
+done
+}
+
+fetch_kubeconfig() {
+local seed ip out tmp cfg
+seed="$(seed_node)" || {
+return 1
+}
+ip="$(node_ip "$seed")"
+out="$LAB_DIR/.kubeconfig"
+tmp="$out.tmp.$$"
+cfg=/etc/kubernetes/admin.conf
+if ssh "$BASE_USER@$ip" "sudo test -f $cfg && sudo cat $cfg" > "$tmp"; then
+  chmod 600 "$tmp"
+  mv "$tmp" "$out"
+  echo "Wrote kubeconfig to $out"
+  echo "Use it with: KUBECONFIG=\"$out\" kubectl get nodes"
+  echo "Or: export KUBECONFIG=\"$out\""
+else
+  rm -f "$tmp"
+  echo "No kubeconfig at $cfg on $seed yet; skipping export."
+  return 0
+fi
+}
+
+up_nodes() {
+summary
+start_storage
+start_network
+create_base_volume
+create_all_nodes
+wait_for_ping
+wait_for_ssh
+add_all_ssh_node_keys
+add_all_proxy_ca_certs
+start_sync_daemons
+run_node_setup
+}
+
+up_cluster() {
+run_seed_setup
+#join_additional_cp_nodes
+join_workers
+fetch_kubeconfig
+}
+
+has_cluster_node_roles() {
+local n role
+for n in "${!NODES[@]}"; do
+  role="$(node_role "$n")"
+  case "$role" in
+    seed|cp|wk) return 0 ;;
+  esac
+done
+return 1
+}
+
+up() {
+up_nodes;
+if has_cluster_node_roles; then
+  up_cluster
+else
+  echo "No cluster node roles defined (seed/cp/wk); skipping cluster bootstrap."
+fi
+}
+
+start() {
+local vm_name
+for n in "${!NODES[@]}"; do
+  vm_name="$(node_resource_name "$n")"
+  virsh start "$vm_name" || true
+done
+start_sync_daemons
+}
+
+stop() {
+stop_sync_daemons
+for n in "${!NODES[@]}"; do
+  local vm_name
+  vm_name="$(node_resource_name "$n")"
+  virsh shutdown "$vm_name" >/dev/null 2>&1 || true
+done
+local deadline=$((SECONDS + 10))
+local pending=()
+local n
+for n in "${!NODES[@]}"; do
+  pending+=("$n")
+done
+while [ ${#pending[@]} -gt 0 ] && [ $SECONDS -lt $deadline ]; do
+  local still=()
+  for n in "${pending[@]}"; do
+    local vm_name
+    vm_name="$(node_resource_name "$n")"
+    if virsh dominfo "$vm_name" >/dev/null 2>&1; then
+      local state
+      state="$(virsh domstate "$vm_name" 2>/dev/null || true)"
+      if [[ "$state" != "shut off" && "$state" != "shutoff" ]]; then
+        still+=("$n")
+      fi
+    fi
+  done
+  pending=("${still[@]}")
+  [ ${#pending[@]} -gt 0 ] && sleep 1
+done
+for n in "${pending[@]}"; do
+  local vm_name
+  vm_name="$(node_resource_name "$n")"
+  virsh destroy "$vm_name" || true
+done
+}
+
+summary() {
+for n in "${!NODES[@]}"; do
+  read -r mem vcpus _ _ <<<"${NODES[$n]}"
+  echo $n $(node_ip $n)
+done
+}
+
+tt() {
+local n="$1"
+shift
+ssh "$BASE_USER@$(node_ip $n)" "$@"
+}
+
+purge() {
+stop_sync_daemons
+purge_all_nodes
+local net_name
+net_name="$(network_resource_name)"
+virsh net-destroy "$net_name" >/dev/null 2>&1 || true
+virsh net-undefine "$net_name" >/dev/null 2>&1 || true
+}
+
+help() {
+cat <<'EOF'
+Usage: lab [--prefix name] <command> [args]
+
+Options:
+  --prefix name       Prefix host-side libvirt resources for this invocation
+                      (same as LAB_PREFIX=name)
+
+Lifecycle (most important):
+  up                 Create/start nodes and run cluster bootstrap (if seed/cp/wk roles exist)
+  start              Start all defined nodes
+  stop               Stop sync daemons, then shut down all nodes
+  purge              Destroy all nodes and remove the lab network
+
+Cluster bootstrap:
+  up_nodes           Infrastructure/node setup only
+  up_cluster         Cluster bootstrap only (seed setup, worker joins, kubeconfig fetch)
+  fetch_kubeconfig   Fetch kubeconfig into ./.kubeconfig
+  run_seed_setup     Run seed setup scripts
+  join_workers       Join worker nodes
+  join_additional_cp_nodes
+                     Join additional control-plane nodes
+
+Sync:
+  sync-list          Show active sync daemons
+  sync-log [-f] [-n N]
+                     Show sync logs; -f follow, -n number of lines
+
+Status and access:
+  summary            Show node names and IPs
+  ips                Print all node IPs
+  node_ip <node>     Print IP for one node
+  tt <node> <cmd...> Run command on node over SSH
+
+Infrastructure and utilities:
+  check              Check required host dependencies and libvirt access
+  start_storage      Ensure libvirt storage pool exists/started
+  start_network      Ensure libvirt network exists/started
+  create_base_volume Create base image volume
+  purge_base_volume  Delete base image volume
+  create_all_nodes   Create overlays/ISOs/VM definitions for all nodes
+  wait_for_ping      Wait until all nodes answer ping
+  wait_for_ssh       Wait until SSH is reachable on all nodes
+  add_all_ssh_node_keys
+                     Add node SSH host keys to known_hosts
+  add_all_proxy_ca_certs
+                     Install proxy CA cert on all nodes (if configured)
+  run_node_setup     Run node setup scripts on all nodes
+  run_seed_setup     Run seed setup scripts on seed cp node
+  var <name>         Print a config variable value
+  keyPath            Print SSH public key path
+  help               Show this help
+
+Config:
+  LAB_PREFIX         Prefix libvirt domains, node volumes, seed ISOs, and network
+                     names. Defaults to the normalized lab project directory name.
+                     Node keys and cloud hostnames remain cp1/wk1/etc.
+  NET_NAME           Libvirt network suffix. Defaults to lc.
+  NET_PREFIX         Optional fixed IPv4 /24 prefix, for example 192.168.125.
+                     If omitted, lab reuses an existing same-name libvirt
+                     network or .network, otherwise allocates a free prefix.
+  NET_PREFIX_POOL_BASE
+  NET_PREFIX_POOL_START
+  NET_PREFIX_POOL_END
+                     Auto-allocation pool. Defaults to 192.168.120-199.
+EOF
+}
+
+VALID_COMMANDS=(
+  up
+  start
+  stop
+  purge
+  up_nodes
+  up_cluster
+  fetch_kubeconfig
+  run_seed_setup
+  join_workers
+  join_additional_cp_nodes
+  sync_list
+  sync_log
+  summary
+  ips
+  node_ip
+  tt
+  check
+  start_storage
+  start_network
+  create_base_volume
+  purge_base_volume
+  create_all_nodes
+  wait_for_ping
+  wait_for_ssh
+  add_all_ssh_node_keys
+  add_all_proxy_ca_certs
+  run_node_setup
+  var
+  keyPath
+  help
+)
+
+is_valid_command() {
+local needle="$1"
+local c
+for c in "${VALID_COMMANDS[@]}"; do
+  if [ "$c" = "$needle" ]; then
+    return 0
+  fi
+done
+return 1
+}
+
+dispatch_command() {
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --prefix)
+      if [ "$#" -lt 2 ]; then
+        echo "Missing value for --prefix" >&2
+        return 1
+      fi
+      LAB_PREFIX_OVERRIDE_SET=1
+      LAB_PREFIX_OVERRIDE="$2"
+      export LAB_PREFIX="$LAB_PREFIX_OVERRIDE"
+      shift 2
+      ;;
+    --prefix=*)
+      LAB_PREFIX_OVERRIDE_SET=1
+      LAB_PREFIX_OVERRIDE="${1#*=}"
+      export LAB_PREFIX="$LAB_PREFIX_OVERRIDE"
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+local raw_cmd="${1:-}"
+if [ -z "$raw_cmd" ]; then
+  help
+  return 0
+fi
+shift || true
+local cmd="${raw_cmd//-/_}"
+if ! is_valid_command "$cmd"; then
+  echo "Unknown command: $raw_cmd" >&2
+  echo
+  help
+  return 1
+fi
+if ! declare -F "$cmd" >/dev/null 2>&1; then
+  echo "Command not implemented: $cmd" >&2
+  return 1
+fi
+case "$cmd" in
+  check) ;;
+  *) read_config ;;
+esac
+"$cmd" "$@"
+}
+
+if ! is_sourced; then
+  dispatch_command "$@"
+fi

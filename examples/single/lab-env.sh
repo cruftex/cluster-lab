@@ -1,0 +1,12 @@
+NODE_SETUP=
+
+NODES=(
+  [box]="4096 2 none ip=65"
+)
+
+# Optional host->node sync mappings (src => dst).
+# Source can be absolute or relative to this lab directory.
+# Destination must be absolute on the nodes.
+declare -gA SYNC_DIRS=(
+  ["./shared"]="/lab"
+)

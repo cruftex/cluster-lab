@@ -1,0 +1,7 @@
+*~
+Downloads
+.lab-sync
+.network
+.network.lock
+examples/*/.kubeconfig
+.sysop-jeans-deploy-italy.sh

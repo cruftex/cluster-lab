@@ -1,0 +1,41 @@
+
+
+PROXY_BUMP_CA_CRT=/etc/squid/ssl/ssl-bump-ca.crt
+POOL=default
+NET_NAME=k8snet
+NET_DOMAIN=k8s.local
+NET_PREFIX=192.168.125
+OSVAR=ubuntu24.04
+DISK_G=20
+BASE_URL=https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+BASE_VOL=noble-server-cloudimg-amd64.img
+# minimal image does not startup, needs debugging
+# BASE_URL=https://cloud-images.ubuntu.com/minimal/releases/noble/release-20260128/ubuntu-24.04-minimal-cloudimg-amd64.img
+# BASE_VOL=ubuntu-24.04-minimal-base.qcow2
+BASE_USER=ubuntu
+
+# Optional SSH key for cloud-init
+SSH_PUBKEY="${SSH_PUBKEY:-}"
+
+for k in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_rsa.pub"; do
+  [[ -z "$SSH_PUBKEY" && -f "$k" ]] && {
+    SSH_PUBKEY="$(<"$k")";
+  }
+done
+
+declare -gA NODES=(
+  [cp1]="4096 2 seed"
+  [wk1]="3072 2 wk" [wk2]="3072 2 wk" [wk3]="3072 2 wk"
+)
+declare -gA SYNC_DIRS=()
+
+SSH_PUBKEY_PATH=""
+KUBE_VERSION=1.34.3
+NODE_SETUP=apt-containerd
+SEED_SETUP=calico
+
+NET_ADDR=$NET_PREFIX.1
+NET_MASK=255.255.255.0
+NET_PREFIX_LEN=24
+DHCP_START=$NET_PREFIX.100
+DHCP_END=$NET_PREFIX.254

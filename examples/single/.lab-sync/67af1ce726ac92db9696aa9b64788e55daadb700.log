@@ -1,0 +1,3 @@
+2026-06-24T08:16:34Z SYNC START node=box src=/home/jeans/proj/kubernetes/examples/single/shared dst=/lab pid=441747
+2026-06-24T08:16:34Z SYNC OK node=box src=/home/jeans/proj/kubernetes/examples/single/shared dst=/lab runtime=0.249s reason=bootstrap
+2026-06-24T08:16:34Z SYNC WATCH START node=box src=/home/jeans/proj/kubernetes/examples/single/shared pid=441805

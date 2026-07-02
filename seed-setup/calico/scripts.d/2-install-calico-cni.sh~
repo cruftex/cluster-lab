@@ -1,0 +1,12 @@
+# as root on cp
+
+# run kubelet
+systemctl enable --now kubelet
+
+export KUBECONFIG=/etc/kubernetes/admin.conf
+# downloading from quay.io fails
+# TODO: Calico images are officially hosted on quay.io
+curl -O https://raw.githubusercontent.com/projectcalico/calico/v3.31.3/manifests/calico.yaml
+sed -i 's|quay.io/|docker.io/|g' calico.yaml
+kubectl apply -f calico.yaml
+
