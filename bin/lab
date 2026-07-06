@@ -1462,19 +1462,27 @@ echo "Complete!"
 # for k0sctrl, you can also do env SSH_KNOWN_HOSTS=/dev/null
 # https://github.com/k0sproject/k0sctl/issues/445#issuecomment-1378680320
 add_ssh_key() {
-local ip="$1"
+local ip="$2"
+local name="$1"
 local known_hosts="$HOME/.ssh/known_hosts"
 mkdir -p "$(dirname "$known_hosts")"
 touch "$known_hosts"
 ssh-keygen -R "$ip" -f "$known_hosts"
 # default is 5 secs timeout
 ssh-keyscan -T 15 -t ed25519 -H "$ip" >> "$known_hosts"
+# echo add key for ${LAB_PREFIX}-${name}....
+# add for the host if its existing
+ssh-keyscan -T 15 -t ed25519 -H ${LAB_PREFIX}-${name} "$ip" >> "$known_hosts" || true
 }
 
 add_all_ssh_node_keys() {
 echo "Adding ssh keys from nodes to ~/.ssh/known_hosts (via ssh-keyscan)"
-for ip in $(ips); do
-  add_ssh_key "$ip"
+#for ip in $(ips); do
+#  add_ssh_key "$ip"
+#done
+for n in "${!NODES[@]}"; do
+  read -r mem vcpus _ _ <<<"${NODES[$n]}"
+  add_ssh_key $n $(node_ip $n)
 done
 }
 
