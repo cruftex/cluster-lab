@@ -9,8 +9,9 @@ NET_DOMAIN=k8s.local
 # Empty means bin/lab derives or allocates the prefix for this lab.
 NET_PREFIX="${NET_PREFIX:-}"
 NET_PREFIX_POOL_BASE="${NET_PREFIX_POOL_BASE:-192.168}"
-NET_PREFIX_POOL_START="${NET_PREFIX_POOL_START:-120}"
-NET_PREFIX_POOL_END="${NET_PREFIX_POOL_END:-199}"
+# 192.168.128.0/18
+NET_PREFIX_POOL_START="${NET_PREFIX_POOL_START:-128}"
+NET_PREFIX_POOL_END="${NET_PREFIX_POOL_END:-191}"
 OSVAR=ubuntu24.04
 DISK_G=20
 BASE_URL=https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
