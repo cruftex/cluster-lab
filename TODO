@@ -1,3 +1,4 @@
+- known_hosts grows, replace host keys instead of adding if existing
 - document intercepting proxy setup via squid
 - document registry setup
 - proxy registry setup documentation
