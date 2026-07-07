@@ -4,9 +4,17 @@ Cluster Lab is lightweight orchestration for KVM virtual machines on top of
 libvirt and `virsh`. It is intended for quickly creating disposable Kubernetes
 lab clusters, roughly like Docker Compose for KVM-backed machines.
 
+## Why not Kind or Minikube?
+
+The scope is different. Kind and minikube are great for testing applications
+or services running on Kubernetes. With this project we can evaluate and
+test the cluster setup itself as well, like networking, storage and even
+injects faults at various levels.
+
 ## Features
 
-- Bash-based orchestration of KVM virtual machines.
+- A local, "production typical" Kubernetes cluster with KVM virtual machines.
+- Bash-based orchestration on top of virsh.
 - A default 4-node Kubernetes lab with one seed/control-plane node and three workers.
 - Cached base images and downloads so rebuilds are fast after the first run.
 - Automatic libvirt resource prefixes so multiple lab directories can run side by side.
@@ -19,7 +27,7 @@ lab clusters, roughly like Docker Compose for KVM-backed machines.
 - Base image customization may need one-time root permission because it uses a
   loopback device and a chroot environment.
 
-## Why Not Terraform or Vagrant?
+## Why not Terraform or Vagrant for the automation?
 
 This project uses `virsh` directly to keep the lab setup transparent and easy to
 debug. Terraform and Vagrant can also manage local virtual machines, but they add
