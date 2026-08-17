@@ -48,3 +48,6 @@ NET_MASK=
 NET_PREFIX_LEN=
 DHCP_START=
 DHCP_END=
+
+LAB_CA_NS=cert-manager
+LAB_CA_SECRET=lab-ca-key-pair
