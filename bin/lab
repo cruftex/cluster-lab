@@ -1769,6 +1769,38 @@ run_node_setup() {
   run_scripts_on_nodes "$BASE_DIR/node-setup/$NODE_SETUP/scripts.d" "${nodes[@]}"
 }
 
+ca_init() {
+
+if kubectl -n "$LAB_CA_NS" get secret "$LAB_CA_SECRET" >/dev/null 2>&1; then
+  echo "CA already exists" 
+  return 1
+fi
+local tmp
+tmp="$(mktemp -d)"
+openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
+  -keyout "$tmp/ca.key" -out "$tmp/ca.crt" \
+  -subj "/CN=lab-ca" -addext "basicConstraints=critical,CA:TRUE"
+kubectl create ns "$LAB_CA_NS" 2>/dev/null || true
+kubectl -n "$LAB_CA_NS" create secret tls "$LAB_CA_SECRET" \
+  --cert="$tmp/ca.crt" --key="$tmp/ca.key"
+rm -rf "$tmp"
+}
+
+ca_import() {
+
+if kubectl -n "$LAB_CA_NS" get secret "$LAB_CA_SECRET" >/dev/null 2>&1; then
+  echo "CA already exists" >&2
+  return 1
+fi
+if [ "$(openssl x509 -in "$1" -noout -pubkey)" != "$(openssl pkey -in "$2" -pubout)" ]; then
+  echo "Key does not match certificate" >&2
+  return 1
+fi
+kubectl create ns "$LAB_CA_NS" 2>/dev/null || true
+kubectl -n "$LAB_CA_NS" create secret tls "$LAB_CA_SECRET" --cert="$1" --key="$2"
+}
+
+
 run_seed_setup() {
   echo "Run $SEED_SETUP setup scripts on seed node"
   local seeds=()
@@ -2045,6 +2077,8 @@ VALID_COMMANDS=(
   var
   keyPath
   help
+  ca_init
+  ca_import
 )
 
 is_valid_command() {
