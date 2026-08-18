@@ -1777,27 +1777,60 @@ if kubectl -n "$LAB_CA_NS" get secret "$LAB_CA_SECRET" >/dev/null 2>&1; then
 fi
 local tmp
 tmp="$(mktemp -d)"
+trap "rm -rf $tmp" RETURN
+
 openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
   -keyout "$tmp/ca.key" -out "$tmp/ca.crt" \
   -subj "/CN=lab-ca" -addext "basicConstraints=critical,CA:TRUE"
 kubectl create ns "$LAB_CA_NS" 2>/dev/null || true
 kubectl -n "$LAB_CA_NS" create secret tls "$LAB_CA_SECRET" \
   --cert="$tmp/ca.crt" --key="$tmp/ca.key"
+secret-tool store \
+    --label="Lab CA certificate" \
+    service lab-ca \
+    type certificate \
+    part tls.crt < "$tmp/ca.crt"
+
+  secret-tool store \
+    --label="Lab CA private key" \
+    service lab-ca \
+    type private-key \
+    part tls.key < "$tmp/ca.key"
 rm -rf "$tmp"
 }
 
 ca_import() {
+local tmp
+tmp=$(mktemp -d)
+trap "rm -rf $tmp" RETURN
 
 if kubectl -n "$LAB_CA_NS" get secret "$LAB_CA_SECRET" >/dev/null 2>&1; then
   echo "CA already exists" >&2
   return 1
 fi
-if [ "$(openssl x509 -in "$1" -noout -pubkey)" != "$(openssl pkey -in "$2" -pubout)" ]; then
+
+if ! secret-tool lookup \
+      service lab-ca \
+      type certificate \
+      part tls.crt > "$tmp/ca.crt"; then
+    echo "CA certificate not found in secret store" >&2
+    return 1
+fi
+if ! secret-tool lookup \
+      service lab-ca \
+      type private-key \
+      part tls.key > "$tmp/ca.key"; then
+    echo "CA private key not found in secret store" >&2
+    return 1
+fi
+
+if [ "$(openssl x509 -in "$tmp/ca.crt" -noout -pubkey)" != "$(openssl pkey -in "$tmp/ca.key" -pubout)" ]; then
   echo "Key does not match certificate" >&2
   return 1
 fi
+
 kubectl create ns "$LAB_CA_NS" 2>/dev/null || true
-kubectl -n "$LAB_CA_NS" create secret tls "$LAB_CA_SECRET" --cert="$1" --key="$2"
+kubectl -n "$LAB_CA_NS" create secret tls "$LAB_CA_SECRET" --cert="$tmp/ca.crt" --key="$tmp/ca.key"
 }
 
 
