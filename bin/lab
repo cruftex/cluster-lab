@@ -1801,6 +1801,54 @@ kubectl -n "$LAB_CA_NS" create secret tls "$LAB_CA_SECRET" --cert="$1" --key="$2
 }
 
 
+ca_issue_https_cert() {
+local host="$1"
+local dir="${3:-}"
+local name="${host//./-}"
+
+if [ -z "$host" ]; then
+  echo "Usage: lab ca-issue-https-cert <hostname> [-d dir]" >&2
+  return 1
+fi
+
+kubectl apply -f - <<EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: $name
+  namespace: $LAB_CA_NS
+spec:
+  secretName: $name-tls
+  dnsNames:
+    - $host
+    - "*.$host"
+  issuerRef:
+    name: lab-ca-issuer
+    kind: ClusterIssuer
+EOF
+
+kubectl -n "$LAB_CA_NS" wait --for=condition=Ready "certificate/$name" --timeout=120s
+
+if [ -z "$dir" ] && command -v secret-tool >/dev/null; then
+  kubectl -n "$LAB_CA_NS" get secret "$name-tls" -o 'jsonpath={.data.tls\.crt}' | base64 -d \
+    | secret-tool store --label="lab cert $host" lab-cert "$host" part tls.crt
+  kubectl -n "$LAB_CA_NS" get secret "$name-tls" -o 'jsonpath={.data.tls\.key}' | base64 -d \
+    | secret-tool store --label="lab key $host" lab-cert "$host" part tls.key
+  echo "Stored cert and key for $host in the keyring"
+  return 0
+fi
+
+if [ -z "$dir" ]; then
+  dir="$LAB_DIR/.config"
+fi
+
+mkdir -p "$dir"
+kubectl -n "$LAB_CA_NS" get secret "$name-tls" -o 'jsonpath={.data.tls\.crt}' | base64 -d > "$dir/tls.crt"
+kubectl -n "$LAB_CA_NS" get secret "$name-tls" -o 'jsonpath={.data.tls\.key}' | base64 -d > "$dir/tls.key"
+echo "Wrote $dir/tls.crt and $dir/tls.key for $host"
+}
+
+
 run_seed_setup() {
   echo "Run $SEED_SETUP setup scripts on seed node"
   local seeds=()
@@ -2079,6 +2127,7 @@ VALID_COMMANDS=(
   help
   ca_init
   ca_import
+  ca_issue_https_cert
 )
 
 is_valid_command() {
