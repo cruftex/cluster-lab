@@ -4,7 +4,40 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ORIGINAL_PATH="$PATH"
 TMP_ROOT="$(mktemp -d)"
-trap 'rm -rf "$TMP_ROOT"' EXIT
+CASE_DIR=""
+CASE_NAME=""
+# Hold a handle on the real stderr. Cases invoke the function under test with
+# 2>"$CASE_DIR/err"; if it dies there (set -e / set -u), the EXIT trap runs while
+# that redirection is still in effect and would write its report into the capture
+# file instead of the terminal.
+exec {REPORT_FD}>&2
+
+# Report loudly on any abort. Cases redirect the function under test into
+# $CASE_DIR/out and $CASE_DIR/err, so without this the diagnostic is deleted with
+# $TMP_ROOT before anyone can read it. An EXIT trap is used deliberately: it also
+# catches set -e and set -u deaths that never reach fail().
+on_exit() {
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    rm -rf "$TMP_ROOT"
+    return 0
+  fi
+  {
+    echo
+    echo "--- test run FAILED (exit $rc)${CASE_NAME:+ during: $CASE_NAME} ---"
+    if [ -n "$CASE_DIR" ]; then
+      local f
+      for f in out err; do
+        if [ -s "$CASE_DIR/$f" ]; then
+          echo "--- captured $f ---"
+          cat "$CASE_DIR/$f"
+        fi
+      done
+    fi
+    echo "--- files kept for inspection: ${CASE_DIR:-$TMP_ROOT} ---"
+  } >&"$REPORT_FD"
+}
+trap on_exit EXIT
 
 . "$REPO_ROOT/bin/lab"
 
@@ -33,6 +66,7 @@ assert_contains() {
 
 setup_case() {
   local name="$1"
+  CASE_NAME="$name"
   CASE_DIR="$TMP_ROOT/$name"
   BASE_DIR="$CASE_DIR/base"
   LAB_DIR="$CASE_DIR/lab"
@@ -49,6 +83,9 @@ setup_case() {
   NET_PREFIX_POOL_BASE=192.168
   NET_PREFIX_POOL_START=120
   NET_PREFIX_POOL_END=125
+  # Keep install_interceptor_network_hook on its skip path: it would otherwise
+  # sudo-install a libvirt hook on the real host from inside a unit test.
+  PROXY_BUMP_CA_CRT=
 }
 
 write_used_host_ip_stub() {

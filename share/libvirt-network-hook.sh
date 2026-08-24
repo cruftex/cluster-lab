@@ -56,7 +56,7 @@ if [ "$ACTION" = "started" ]; then
     iptables -A "$INPUT" -i "$BRIDGE" -o dummy1 -j ACCEPT
     iptables -A "$FORWARD" -i "$BRIDGE" -o dummy1 -j ACCEPT
     # redirect registry traffic to registry that is on the localhost, if its in the /etc/hosts
-#    if test -n "registry_ip"; then
+#    if test -n "$registry_ip"; then
 #      iptables -t nat -A $PREROUTING -i "$BRIDGE" -p tcp -d $registry_ip --dport 5000 -j DNAT --to-destination 127.0.0.1:5000
 #      iptables -A $INPUT -i "$BRIDGE" -p tcp --dport 5000 -j ACCEPT
 #      iptables -A $FORWARD -i "$BRIDGE" -p tcp --dport 5000 -j ACCEPT

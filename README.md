@@ -94,8 +94,7 @@ CA is present. Everything else runs as your user.
 
 On Debian or Ubuntu, run `lab check` after installation. It prints the exact
 `apt-get install` command for missing packages and warns if libvirt access is not
-configured for the current user. Note that `lab check` does not yet verify
-`python3` or the `qemu-nbd` image customization tools, so check those yourself.
+configured for the current user.
 
 ## Quick Start
 
@@ -450,8 +449,6 @@ Setting up the mirror or the intercepting proxy itself is not yet documented; se
 - **The libvirt storage pool is named `default`** and is created at
   `/var/lib/libvirt/images` if it does not exist.
 - **Nodes need outbound internet access** unless a mirror or proxy is reachable.
-- **`lab check` is incomplete.** It does not check `python3` or the image
-  customization tools, so it can report success on a host where `lab up` fails.
 
 ## Why Not Kind, Minikube, Terraform or Vagrant?
 
