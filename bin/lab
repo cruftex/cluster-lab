@@ -2004,13 +2004,14 @@ Config:
                      names. Defaults to the normalized lab project directory name.
                      Node keys and cloud hostnames remain cp1/wk1/etc.
   NET_NAME           Libvirt network suffix. Defaults to lc.
-  NET_PREFIX         Optional fixed IPv4 /24 prefix, for example 192.168.125.
+  NET_PREFIX         Optional fixed network prefix, for example 192.168.125. The lab
+                     network is always a /24, so this is its first three octets.
                      If omitted, lab reuses an existing same-name libvirt
                      network or .network, otherwise allocates a free prefix.
   NET_PREFIX_POOL_BASE
   NET_PREFIX_POOL_START
   NET_PREFIX_POOL_END
-                     Auto-allocation pool. Defaults to 192.168.120-199.
+                     Auto-allocation pool. Defaults to 192.168.128-191.
 EOF
 }
 
