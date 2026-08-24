@@ -969,7 +969,14 @@ check() {
     [uniq]="coreutils"
     [paste]="coreutils"
     [sed]="sed"
+    [python3]="python3"
     [growpart]="cloud-guest-utils"
+    [qemu-nbd]="qemu-utils"
+    [partprobe]="parted"
+    [e2fsck]="e2fsprogs"
+    [resize2fs]="e2fsprogs"
+    [lsblk]="util-linux"
+    [udevadm]="udev"
   )
 
   local required_pkgs=(
@@ -1045,7 +1052,7 @@ virsh pool-autostart "$POOL" || true
 }
 
 install_interceptor_network_hook() {
-test -f $PROXY_BUMP_CA_CRT || {
+test -f "${PROXY_BUMP_CA_CRT:-}" || {
   echo "Skip HTTP/HTTPS interceptor..."
   return 0
 }
@@ -1247,7 +1254,7 @@ if ! virsh vol-info --pool "$POOL" "$FINAL_VOL" >/dev/null 2>&1; then
   test -f $tmp || curl -L "$BASE_URL" -o "$tmp"
   local script=$BASE_DIR/node-setup/$NODE_SETUP/customize-image.sh
   if test -f $script; then
-    test -f "$tmp-custom" || {
+    test -f "$tmp-$NODE_SETUP" || {
       echo "Image customization requires sudo..."
       # export relevant variables
       export KUBE_VERSION
@@ -1389,13 +1396,6 @@ create_node() {
 #start_network
 #create_base_volume
 
-test_single_node() {
-create_overlay cp1
-create_seed_iso cp1
-ensure_vm cp1 4096 2
-SADJASD
-}
-
 create_all_nodes() {
 echo "[*] Creating overlays, seed ISOs, and VMs…"
 for n in "${!NODES[@]}"; do
@@ -1472,7 +1472,9 @@ ssh-keygen -R "$ip" -f "$known_hosts"
 ssh-keyscan -T 15 -t ed25519 -H "$ip" >> "$known_hosts"
 # echo add key for ${LAB_PREFIX}-${name}....
 # add for the host if its existing
-ssh-keyscan -T 15 -t ed25519 -H ${LAB_PREFIX}-${name} "$ip" >> "$known_hosts" || true
+# replace, do not append: this runs on every lab up
+ssh-keygen -R "${LAB_PREFIX}-${name}" -f "$known_hosts" >/dev/null 2>&1 || true
+ssh-keyscan -T 15 -t ed25519 -H "${LAB_PREFIX}-${name}" "$ip" >> "$known_hosts" || true
 }
 
 add_all_ssh_node_keys() {
@@ -1488,7 +1490,7 @@ done
 
 # add the proxy ca to speed up downloads
 add_proxy_ca_cert() {
-test -f $PROXY_BUMP_CA_CRT || {
+test -f "${PROXY_BUMP_CA_CRT:-}" || {
   echo "Skip installing interceptor cert..."
   return 0
 }
@@ -1598,9 +1600,11 @@ run_scripts_on_nodes() {
     return 0
   fi
 
+  shopt -s nullglob
   for s in "$script_dir"/*.sh; do
     scripts+=("$s")
   done
+  shopt -u nullglob
 
   if [ ${#scripts[@]} -eq 0 ]; then
     echo "No $(basename "$script_dir") scripts found"
@@ -1964,7 +1968,7 @@ Cluster bootstrap:
   up_nodes           Infrastructure/node setup only
   up_cluster         Cluster bootstrap only (seed setup, worker joins, kubeconfig fetch)
   fetch_kubeconfig   Fetch kubeconfig into ./.kubeconfig
-  run_seed_setup     Run seed setup scripts
+  run_seed_setup     Run seed setup scripts on seed cp node
   join_workers       Join worker nodes
   join_additional_cp_nodes
                      Join additional control-plane nodes
@@ -1994,7 +1998,6 @@ Infrastructure and utilities:
   add_all_proxy_ca_certs
                      Install proxy CA cert on all nodes (if configured)
   run_node_setup     Run node setup scripts on all nodes
-  run_seed_setup     Run seed setup scripts on seed cp node
   var <name>         Print a config variable value
   keyPath            Print SSH public key path
   help               Show this help
@@ -2105,7 +2108,7 @@ if ! declare -F "$cmd" >/dev/null 2>&1; then
   return 1
 fi
 case "$cmd" in
-  check) ;;
+  check|help) ;;
   *) read_config ;;
 esac
 "$cmd" "$@"
