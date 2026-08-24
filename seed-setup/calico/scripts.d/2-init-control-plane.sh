@@ -20,11 +20,26 @@
 
 # defaut is set in main script, however, make this work standalone as well
 : "${KUBE_VERSION:=1.34.3}"
-kubeadm init --kubernetes-version "v${KUBE_VERSION#v}" --pod-network-cidr=10.244.0.0/16
 
-echo "export KUBECONFIG=/etc/kubernetes/admin.conf" >> /root/.bashrc
+# this runs on every lab up, so skip the init if the cluster is already bootstrapped
+if test -f /etc/kubernetes/admin.conf; then
+  echo "Control plane already initialized, skipping kubeadm init"
+else
+  kubeadm init --kubernetes-version "v${KUBE_VERSION#v}" --pod-network-cidr=10.244.0.0/16
+fi
+
+kubeconfig_export="export KUBECONFIG=/etc/kubernetes/admin.conf"
+
+# append only once, otherwise the line piles up on every run
+add_kubeconfig_export() {
+  local rc_file="$1"
+  touch "$rc_file"
+  grep -qxF "$kubeconfig_export" "$rc_file" || echo "$kubeconfig_export" >> "$rc_file"
+}
+
+add_kubeconfig_export /root/.bashrc
 if test -n "$SUDO_USER"; then
-  echo "export KUBECONFIG=/etc/kubernetes/admin.conf" >> /home/$SUDO_USER/.profile
+  add_kubeconfig_export "/home/$SUDO_USER/.profile"
   chgrp sudo /etc/kubernetes/admin.conf
   chmod 660 /etc/kubernetes/admin.conf
 fi

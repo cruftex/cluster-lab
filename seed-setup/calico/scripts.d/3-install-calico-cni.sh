@@ -20,7 +20,7 @@ kubectl wait --for condition=Established crd/felixconfigurations.crd.projectcali
 # Its a common pattern that internal cluster traffic is unencrypted (http instead of https)
 # With this setting we encrypt all internal traffic leaving a node
 
-cat >> calico-wireguard.yaml <<'EOF'
+cat > calico-wireguard.yaml <<'EOF'
 ---
 apiVersion: crd.projectcalico.org/v1
 kind: FelixConfiguration
