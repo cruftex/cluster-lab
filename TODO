@@ -1,3 +1,4 @@
+- align function indentation everywhere
 - document intercepting proxy setup via squid
 - document registry setup
 - proxy registry setup documentation
