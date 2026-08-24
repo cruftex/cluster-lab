@@ -1972,6 +1972,7 @@ Cluster bootstrap:
   join_workers       Join worker nodes
   join_additional_cp_nodes
                      Join additional control-plane nodes
+  run_node_setup     Run node setup scripts on all nodes
 
 Sync:
   sync-list          Show active sync daemons
@@ -1997,7 +1998,6 @@ Infrastructure and utilities:
                      Add node SSH host keys to known_hosts
   add_all_proxy_ca_certs
                      Install proxy CA cert on all nodes (if configured)
-  run_node_setup     Run node setup scripts on all nodes
   var <name>         Print a config variable value
   keyPath            Print SSH public key path
   help               Show this help
