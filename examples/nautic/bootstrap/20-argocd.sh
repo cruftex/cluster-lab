@@ -17,7 +17,7 @@ curl -fsSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/do
 install -m 555 argocd-linux-amd64 /usr/local/bin
 rm argocd-linux-amd64
 
-kubectl create namespace "$ARGOCD_NS"
+kubectl create namespace "$ARGOCD_NS" --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -n argocd --server-side --force-conflicts -f https://raw.githubusercontent.com/argoproj/argo-cd/$ARGOCD_VERSION/manifests/install.yaml
 
 
@@ -42,10 +42,10 @@ kubectl -n "$ARGOCD_NS" rollout status deploy/argocd-repo-server --timeout=180s
 #
 IP=$(hostname -I | awk '{print $1}')
 REPO_URL=ssh://git@$IP/srv/git/cluster.git
-REPO_KEY=/srv/git/.ssh/authorized_keys
+REPO_KEY=/srv/git/.ssh/id_ed25519
 (
   kubectl -n argocd get cm argocd-ssh-known-hosts-cm -o jsonpath='{.data.ssh_known_hosts}' 
-  ssh-keyscan $I 
+  ssh-keyscan "$IP"
 ) | sort -u -o /tmp/new_known_hosts
 kubectl -n argocd create configmap argocd-ssh-known-hosts-cm \
   --from-file=ssh_known_hosts=/tmp/new_known_hosts \
