@@ -1038,9 +1038,153 @@ check() {
   return 0
 }
 
+# Where the pool keeps node disks and seed ISOs. Falls back to the location
+# start_storage would create if the pool is not defined yet.
+pool_target_path() {
+local path
+path="$(virsh pool-dumpxml "${POOL:-default}" 2>/dev/null | sed -n 's|.*<path>\(.*\)</path>.*|\1|p' | head -n1)"
+if [ -z "$path" ]; then
+  path=/var/lib/libvirt/images
+fi
+echo "$path"
+}
+
+# Echo "<mount> <avail-kib> <use-percent>" for the filesystem holding a path.
+# Empty output means it could not be determined.
+read_disk_stats() {
+local path="$1"
+local mount avail_k use_pct
+read -r mount avail_k use_pct < <(df -P -k "$path" 2>/dev/null | awk 'NR==2 { gsub(/%/, "", $5); print $6, $4, $5 }')
+if [[ ! ${avail_k:-} =~ ^[0-9]+$ || ! ${use_pct:-} =~ ^[0-9]+$ ]]; then
+  return 1
+fi
+echo "$mount $avail_k $use_pct"
+}
+
+# Format a byte count as 1.6G / 551.0M / 812K.
+human_bytes() {
+awk -v b="${1:-0}" 'BEGIN {
+  if (b >= 1073741824) { printf "%.1fG", b / 1073741824 }
+  else if (b >= 1048576) { printf "%.1fM", b / 1048576 }
+  else if (b >= 1024) { printf "%.1fK", b / 1024 }
+  else { printf "%dB", b }
+}'
+}
+
+# Host-side per-node stats for "status". Each of these degrades to empty output rather
+# than failing, so a node that is missing or not running just shows "-" in the table.
+
+# The disk target (vda, ...) that carries the node volume. domblklist also lists the
+# seed ISO, so match on the volume name instead of taking the first row.
+node_disk_target() {
+local vm_name disk_name
+vm_name="$(node_resource_name "$1")"
+disk_name="$(node_disk_name "$1")"
+virsh domblklist "$vm_name" 2>/dev/null \
+  | awk -v want="$disk_name" 'index($2, want) { print $1; exit }' || true
+}
+
+# Allocation (bytes actually consumed on the host) and Capacity (configured size).
+# Works in every domain state, unlike most other stats.
+node_disk_usage() {
+local vm_name target
+vm_name="$(node_resource_name "$1")"
+target="$(node_disk_target "$1")"
+if [ -z "$target" ]; then
+  return 1
+fi
+virsh domblkinfo "$vm_name" "$target" 2>/dev/null \
+  | awk '/^Capacity:/ { cap = $2 } /^Allocation:/ { alloc = $2 } END { if (cap != "") print alloc, cap }' || true
+}
+
+# Guest-reported free memory in KiB. Needs the virtio-balloon stats period to be set,
+# see ensure_vm; returns nothing when the domain is not running or has no stats.
+node_free_mem_kib() {
+local vm_name
+vm_name="$(node_resource_name "$1")"
+virsh dommemstat "$vm_name" 2>/dev/null \
+  | awk '$1 == "usable" { u = $2 } $1 == "unused" { n = $2 } END { if (u != "") print u; else if (n != "") print n }' || true
+}
+
+# The host tap for this node. Only exists while the domain runs, so traffic counters
+# are since-boot and disappear on restart.
+node_tap_name() {
+local vm_name iface
+vm_name="$(node_resource_name "$1")"
+iface="$(virsh domiflist "$vm_name" 2>/dev/null | awk 'NR>2 && $1 != "" && $1 != "-" { print $1; exit }' || true)"
+echo "$iface"
+}
+
+# Node traffic in bytes as "<rx> <tx>", from the node's point of view. The tap counters
+# are host-relative, so they are swapped here: what the host receives on the tap is what
+# the node sent.
+node_traffic_bytes() {
+local tap tap_rx tap_tx
+tap="$(node_tap_name "$1")"
+if [ -z "$tap" ]; then
+  return 1
+fi
+tap_rx="$(cat "/sys/class/net/$tap/statistics/rx_bytes" 2>/dev/null)"
+tap_tx="$(cat "/sys/class/net/$tap/statistics/tx_bytes" 2>/dev/null)"
+if [[ ! ${tap_rx:-} =~ ^[0-9]+$ || ! ${tap_tx:-} =~ ^[0-9]+$ ]]; then
+  return 1
+fi
+echo "$tap_tx $tap_rx"
+}
+
+# Cumulative CPU nanoseconds. domstats is used rather than cpu-stats because it also
+# works on domains that are not running.
+node_cpu_time_ns() {
+local vm_name
+vm_name="$(node_resource_name "$1")"
+virsh domstats "$vm_name" --cpu-total 2>/dev/null \
+  | awk -F= '$1 ~ /cpu\.time$/ { print $2; exit }' || true
+}
+
+# qemu pauses a guest with an I/O error when a write hits ENOSPC. That surfaces as an
+# unreachable node rather than a disk problem, so refuse to start domains while the
+# filesystems holding node disks or cached base images are too tight.
+check_disk_space() {
+local min_free_g="${MIN_FREE_DISK_G:-15}"
+local max_usage_pct="${MAX_DISK_USAGE_PCT:-90}"
+if [ "$min_free_g" -le 0 ] && [ "$max_usage_pct" -ge 100 ]; then
+  return 0
+fi
+local min_free_k=$((min_free_g * 1024 * 1024))
+local rc=0
+local path mount avail_k use_pct avail_g
+declare -A seen=()
+for path in "$(pool_target_path)" "$DOWNLOAD_DIR"; do
+  test -d "$path" || continue
+  if ! read -r mount avail_k use_pct < <(read_disk_stats "$path"); then
+    echo "Cannot determine free disk space for $path" >&2
+    rc=1
+    continue
+  fi
+  if [ -n "${seen[$mount]:-}" ]; then
+    continue
+  fi
+  seen[$mount]=1
+  avail_g="$(awk -v k="$avail_k" 'BEGIN { printf "%.1f", k / 1048576 }')"
+  if [ "$avail_k" -lt "$min_free_k" ] || [ "$use_pct" -gt "$max_usage_pct" ]; then
+    echo "Not enough disk space on $mount (holds $path): ${avail_g}GiB free, ${use_pct}% used." >&2
+    echo "Need at least ${min_free_g}GiB free and at most ${max_usage_pct}% used." >&2
+    rc=1
+  else
+    echo "Disk space on $mount: ${avail_g}GiB free, ${use_pct}% used."
+  fi
+done
+if [ "$rc" -ne 0 ]; then
+  echo "Starting nodes now risks qemu pausing them with I/O errors, which looks like an unreachable node." >&2
+  echo "Free disk space, or adjust MIN_FREE_DISK_G / MAX_DISK_USAGE_PCT in lab-env.sh." >&2
+fi
+return "$rc"
+}
+
 start_storage() {
 echo "Start storage pool..."
-local pool_target="/var/lib/libvirt/images"
+local pool_target
+pool_target="$(pool_target_path)"
 if ! virsh pool-info "$POOL" >/dev/null 2>&1; then
   echo "Defining storage pool $POOL at $pool_target"
   mkdir -p "$pool_target"
@@ -1374,6 +1518,7 @@ ensure_vm() {
       --os-variant "$OSVAR" \
       --import \
       --network network="$net_name",model=virtio \
+      --memballoon model=virtio,stats.period=10 \
       --disk vol="$POOL/${disk_name}",bus=virtio,discard=unmap \
       --disk vol="$POOL/${iso_name}",device=cdrom,readonly=on \
       --graphics none \
@@ -1845,6 +1990,7 @@ fi
 }
 
 up_nodes() {
+check_disk_space || return 1
 summary
 start_storage
 start_network
@@ -1886,6 +2032,7 @@ fi
 }
 
 start() {
+check_disk_space || return 1
 local vm_name
 for n in "${!NODES[@]}"; do
   vm_name="$(node_resource_name "$n")"
@@ -1952,6 +2099,171 @@ virsh net-destroy "$net_name" >/dev/null 2>&1 || true
 virsh net-undefine "$net_name" >/dev/null 2>&1 || true
 }
 
+# Host-side overview of the lab: where the nodes are, whether they are really running,
+# what they consume against what was configured, and how much traffic they moved.
+# Deliberately does not use ssh: this is most useful when a node is unreachable.
+#
+# With an interval it reprints every <interval> seconds until interrupted, and adds a CPU
+# column. libvirt only exposes a cumulative cpu.time counter, so a percentage needs two
+# samples; the gap between prints is the measurement window.
+status() {
+if [ "$#" -gt 1 ]; then
+  echo "Usage: lab status [interval-seconds]" >&2
+  return 1
+fi
+local interval="${1:-}"
+if [ -n "$interval" ] && [[ ! $interval =~ ^[1-9][0-9]*$ ]]; then
+  echo "Usage: lab status [interval-seconds]" >&2
+  return 1
+fi
+
+local nodes=()
+mapfile -t nodes < <(printf '%s\n' "${!NODES[@]}" | sort)
+
+local fmt
+if [ -n "$interval" ]; then
+  fmt='%-6s %-15s %-20s %7s   %-17s %-15s %10s %10s\n'
+else
+  fmt='%-6s %-15s %-20s %-17s %-15s %10s %10s\n'
+fi
+
+# Restore whatever INT handling was in place; bin/lab is sourced by the tests, so the
+# handler must not outlive this call. A flag plus break is used instead of exiting, so
+# that a sourced shell is never terminated.
+local saved_int_trap
+saved_int_trap="$(trap -p INT)"
+STATUS_INTERRUPTED=0
+if [ -n "$interval" ]; then
+  trap 'STATUS_INTERRUPTED=1' INT
+fi
+
+declare -A prev_cpu=()
+local prev_ns=0
+local first=1
+
+while true; do
+  local now_ns window_s
+  now_ns="$(date +%s%N)"
+  window_s=""
+  if [ "$prev_ns" -ne 0 ]; then
+    window_s="$(awk -v a="$prev_ns" -v b="$now_ns" 'BEGIN { printf "%.1f", (b - a) / 1000000000 }')"
+  fi
+
+  if [ -n "$interval" ]; then
+    if [ "$first" -eq 1 ]; then
+      printf '=== %s ===\n' "$(date -u '+%Y-%m-%d %H:%M:%SZ')"
+    else
+      printf '=== %s  (cpu over %ss) ===\n' "$(date -u '+%Y-%m-%d %H:%M:%SZ')" "$window_s"
+    fi
+  else
+    printf 'Lab %s   network %s   %s.0/%s\n\n' \
+      "${LAB_PREFIX:-none}" "$(network_resource_name)" "${NET_PREFIX:-?}" "${NET_PREFIX_LEN:-24}"
+  fi
+
+  if [ -n "$interval" ]; then
+    # shellcheck disable=SC2059
+    printf "$fmt" NODE IP STATE CPU "MEMORY free/max" "DISK used/max" RX TX
+  else
+    printf "$fmt" NODE IP STATE "MEMORY free/max" "DISK used/max" RX TX
+  fi
+
+  local total_rx=0 total_tx=0 mem_hint=0
+  local n vm_name mem_max vcpus state ip
+  local free_kib mem_disp disk_disp rx_disp tx_disp cpu_disp
+  local alloc cap rx tx cpu_now
+  for n in "${nodes[@]}"; do
+    vm_name="$(node_resource_name "$n")"
+    read -r mem_max vcpus _ _ <<<"${NODES[$n]}"
+    ip="$(node_ip "$n" 2>/dev/null || echo '-')"
+
+    state="$(virsh domstate --reason "$vm_name" 2>/dev/null || true)"
+    if [ -z "$state" ]; then
+      state="not defined"
+    fi
+
+    mem_disp="-/$(human_bytes $((mem_max * 1024 * 1024)))"
+    free_kib="$(node_free_mem_kib "$n")"
+    if [[ ${free_kib:-} =~ ^[0-9]+$ ]]; then
+      mem_disp="$(human_bytes $((free_kib * 1024)))/$(human_bytes $((mem_max * 1024 * 1024)))"
+    elif [ "${state%% *}" = running ]; then
+      mem_hint=1
+    fi
+
+    disk_disp="-"
+    if read -r alloc cap < <(node_disk_usage "$n"); then
+      disk_disp="$(human_bytes "$alloc")/$(human_bytes "$cap")"
+    fi
+
+    rx_disp="-"
+    tx_disp="-"
+    if read -r rx tx < <(node_traffic_bytes "$n"); then
+      rx_disp="$(human_bytes "$rx")"
+      tx_disp="$(human_bytes "$tx")"
+      total_rx=$((total_rx + rx))
+      total_tx=$((total_tx + tx))
+    fi
+
+    cpu_disp="-"
+    cpu_now="$(node_cpu_time_ns "$n")"
+    if [[ ${cpu_now:-} =~ ^[0-9]+$ ]]; then
+      if [ -n "${prev_cpu[$n]:-}" ] && [ "$prev_ns" -ne 0 ]; then
+        # normalised by vcpus, so 100% means every allocated vcpu saturated
+        cpu_disp="$(awk -v c0="${prev_cpu[$n]}" -v c1="$cpu_now" -v t0="$prev_ns" -v t1="$now_ns" -v v="$vcpus" \
+          'BEGIN { d = t1 - t0; if (d <= 0 || v <= 0) { print "-" } else { printf "%.1f%%", (c1 - c0) * 100 / (d * v) } }')"
+      fi
+      prev_cpu[$n]="$cpu_now"
+    else
+      unset "prev_cpu[$n]"
+    fi
+
+    if [ -n "$interval" ]; then
+      # shellcheck disable=SC2059
+      printf "$fmt" "$n" "$ip" "$state" "$cpu_disp" "$mem_disp" "$disk_disp" "$rx_disp" "$tx_disp"
+    else
+      printf "$fmt" "$n" "$ip" "$state" "$mem_disp" "$disk_disp" "$rx_disp" "$tx_disp"
+    fi
+  done
+
+  printf '\nTraffic total   RX %s   TX %s   (since node boot, reset when a node restarts)\n' \
+    "$(human_bytes "$total_rx")" "$(human_bytes "$total_tx")"
+
+  local mount avail_k use_pct
+  if read -r mount avail_k use_pct < <(read_disk_stats "$(pool_target_path)"); then
+    printf 'Host disk %-5s %sGiB free, %s%% used   (limits: %sGiB free, %s%% used)\n' \
+      "$mount" "$(awk -v k="$avail_k" 'BEGIN { printf "%.1f", k / 1048576 }')" "$use_pct" \
+      "${MIN_FREE_DISK_G:-15}" "${MAX_DISK_USAGE_PCT:-90}"
+  fi
+
+  if [ "$mem_hint" -eq 1 ]; then
+    echo "Memory unavailable for running nodes: enable balloon stats with" \
+      "virsh dommemstat <domain> --period 10 --live --config"
+  fi
+
+  if [ -z "$interval" ]; then
+    echo
+    echo "For CPU statistics use continuous reporting with:"
+    echo "lab status <interval-seconds>"
+    break
+  fi
+  if [ "$STATUS_INTERRUPTED" -eq 1 ]; then
+    break
+  fi
+  prev_ns="$now_ns"
+  first=0
+  echo
+  sleep "$interval" || true
+  if [ "$STATUS_INTERRUPTED" -eq 1 ]; then
+    break
+  fi
+done
+
+trap - INT
+if [ -n "$saved_int_trap" ]; then
+  eval "$saved_int_trap"
+fi
+return 0
+}
+
 help() {
 cat <<'EOF'
 Usage: lab [--prefix name] <command> [args]
@@ -1982,6 +2294,8 @@ Sync:
                      Show sync logs; -f follow, -n number of lines
 
 Status and access:
+  status [interval]  Show node state, memory, disk and traffic. With an interval,
+                     reprint every N seconds with a CPU column until interrupted.
   summary            Show node names and IPs
   ips                Print all node IPs
   node_ip <node>     Print IP for one node
@@ -2017,6 +2331,9 @@ Config:
   NET_PREFIX_POOL_START
   NET_PREFIX_POOL_END
                      Auto-allocation pool. Defaults to 192.168.128-191.
+  MIN_FREE_DISK_G    Refuse to start nodes below this much free disk. Default 15.
+  MAX_DISK_USAGE_PCT Refuse to start nodes above this disk usage. Default 90.
+                     Set 0 / 100 to disable the check.
 EOF
 }
 
@@ -2033,6 +2350,7 @@ VALID_COMMANDS=(
   join_additional_cp_nodes
   sync_list
   sync_log
+  status
   summary
   ips
   node_ip

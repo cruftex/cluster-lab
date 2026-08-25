@@ -237,6 +237,8 @@ lab stop               # Stop sync daemons, then shut down nodes
 lab purge              # Destroy all lab nodes and remove the lab network
 lab purge-base-volume  # Also discard the cached base image, forcing a rebuild
 
+lab status             # Node state, memory, disk and traffic in one table
+lab status 5           # Same, reprinted every 5s with a CPU column, until Ctrl-C
 lab summary            # Show node names and IPs
 lab ips                # Print all node IPs
 lab node-ip wk1        # Print one node IP
@@ -251,6 +253,15 @@ lab help               # Show the full command list
 `lab help` also lists the individual bootstrap steps (`up-nodes`, `up-cluster`,
 `run-node-setup`, `run-seed-setup`, `join-workers`, and so on), which are useful
 for re-running a single phase after a failure.
+
+`lab status` reads everything from the host through libvirt, never over SSH, so it
+still works for a node that has stopped answering. It shows each node's
+`domstate --reason`, guest-reported free memory against the configured maximum, the
+host disk the node's image actually occupies against its configured size, and
+per-node traffic counters. Traffic is counted since the node booted and resets when
+it restarts. Passing an interval adds a CPU column: libvirt only exposes a
+cumulative CPU counter, so the percentage is measured across the gap between two
+prints, normalised so 100% means every allocated vCPU is saturated.
 
 Command names may be written with dashes. Internally, `lab` also accepts the
 underscore form used by shell function names.
@@ -279,6 +290,17 @@ Virtual machines:
   default login user. Default is the Ubuntu 24.04 noble amd64 cloud image.
 - `OSVAR`: libvirt `--os-variant`, default `ubuntu24.04`.
 - `POOL`: libvirt storage pool, default `default`.
+- `MIN_FREE_DISK_G`: refuse to start nodes with less free disk than this, default
+  `15`.
+- `MAX_DISK_USAGE_PCT`: refuse to start nodes above this disk usage, default `90`.
+  Set `MIN_FREE_DISK_G=0` and `MAX_DISK_USAGE_PCT=100` to disable the check.
+
+`lab up` and `lab start` check both thresholds against the filesystems holding the
+libvirt pool and the `Downloads/` image cache, and refuse to start anything if
+either is exceeded. This is a guard against a confusing failure: when a disk fills
+up, qemu pauses the guest with an I/O error, and because a paused VM does not answer
+ARP, `ssh` reports `No route to host` as if the network were broken. See
+[Troubleshooting](#troubleshooting).
 
 Networking:
 
@@ -489,6 +511,15 @@ transparent and easy to debug.
   the lab, or remove the stale libvirt network after confirming it is unused.
 - Need a fresh kubeconfig: run `lab fetch-kubeconfig` from the lab directory.
 - Suspect a bad base image: run `lab purge-base-volume`, then `lab up` again.
+- `Not enough disk space on …`: free space, or lower `MIN_FREE_DISK_G` /
+  raise `MAX_DISK_USAGE_PCT`. `lab purge` reclaims the node disks, and stale
+  images in `Downloads/` for setups you no longer use can be deleted.
+- `ssh: connect to host … No route to host` on a node that `lab up` just
+  reported as fine: run `lab status`, which shows each node's state directly. A guest
+  shown as `paused (I/O error)` ran out of disk — qemu pauses it on `ENOSPC`,
+  and a paused VM does not answer ARP, so `ssh` fails as if the network were
+  down. Free space, then `lab purge` and `lab up`; the guest filesystem may
+  have seen write errors, so a rebuild is safer than resuming.
 
 ## Development
 

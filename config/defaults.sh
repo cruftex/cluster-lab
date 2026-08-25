@@ -4,6 +4,12 @@ PROXY_BUMP_CA_CRT=/etc/squid/ssl/ssl-bump-ca.crt
 # Empty means bin/lab derives the prefix from the lab project directory name.
 LAB_PREFIX="${LAB_PREFIX:-}"
 POOL=default
+# Refuse to start domains when the filesystems holding VM disks or cached base
+# images are this tight. qemu pauses a guest with an I/O error when a write hits
+# ENOSPC, which looks like an unreachable node rather than a disk problem.
+# Set MIN_FREE_DISK_G=0 and MAX_DISK_USAGE_PCT=100 to disable the check.
+MIN_FREE_DISK_G="${MIN_FREE_DISK_G:-15}"
+MAX_DISK_USAGE_PCT="${MAX_DISK_USAGE_PCT:-90}"
 NET_NAME=lc
 NET_DOMAIN=k8s.local
 # Empty means bin/lab derives or allocates the prefix for this lab.
