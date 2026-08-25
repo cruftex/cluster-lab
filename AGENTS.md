@@ -81,6 +81,8 @@ Four things must stay true or the suite breaks:
    `$SOME_CONFIG_VAR` is an unbound-variable error that kills the entire run. This is not
    hypothetical: a bare `$PROXY_BUMP_CA_CRT` in `install_interceptor_network_hook` made one
    test fail silently for the life of the repo.
+5. If root is required, print the command that should be executed, never do sudo in the script
+   directly.
 
 ## Adding a lab command
 

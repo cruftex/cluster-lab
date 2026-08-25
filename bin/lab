@@ -1062,8 +1062,10 @@ if [ -r "$hook_path" ] && cmp -s "$hook_script" "$hook_path"; then
   echo "Interceptor network hook at $hook_path is already up to date; skipping."
   return 0
 fi
-echo "Need to sudo to install the squid interceptor network hook that manages iptables rules"
-sudo install -D -m 0755 "$hook_script" "$hook_path"
+echo "Install the squid interceptor network hook that manages iptables rules:"
+echo
+echo sudo install -D -m 0755 "$hook_script" "$hook_path"
+return 1
 }
 
 install_iptables_hook() {
