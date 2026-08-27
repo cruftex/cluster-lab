@@ -1771,10 +1771,20 @@ run_node_setup() {
 
 ca_init() {
 
-if kubectl -n "$LAB_CA_NS" get secret "$LAB_CA_SECRET" >/dev/null 2>&1; then
-  echo "CA already exists" 
+if ! command -v secret-tool >/dev/null 2>&1 ; then
+  echo "secret-tool not found" >&2
   return 1
 fi
+if ! secret-tool search name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
+  echo "Secret Service is not available" >&2
+  return 1
+fi
+
+if [ -f "$LAB_CA_CRT" ] && secret-tool lookup name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
+  echo "Lab CA already exists: $LAB_CA_CRT" >&2
+  return 1
+fi
+
 local tmp
 tmp="$(mktemp -d)"
 trap "rm -rf $tmp" RETURN
@@ -1782,104 +1792,73 @@ trap "rm -rf $tmp" RETURN
 openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
   -keyout "$tmp/ca.key" -out "$tmp/ca.crt" \
   -subj "/CN=lab-ca" -addext "basicConstraints=critical,CA:TRUE"
-kubectl create ns "$LAB_CA_NS" 2>/dev/null || true
-kubectl -n "$LAB_CA_NS" create secret tls "$LAB_CA_SECRET" \
-  --cert="$tmp/ca.crt" --key="$tmp/ca.key"
-secret-tool store \
-    --label="Lab CA certificate" \
-    service lab-ca \
-    type certificate \
-    part tls.crt < "$tmp/ca.crt"
 
-  secret-tool store \
-    --label="Lab CA private key" \
-    service lab-ca \
-    type private-key \
-    part tls.key < "$tmp/ca.key"
-rm -rf "$tmp"
+secret-tool store \
+  --label="$LAB_CA_KEY_LABEL" \
+  name "$LAB_CA_KEY_NAME" < "$tmp/ca.key"
+
+mkdir -p "$(dirname "$LAB_CA_CRT")"
+cp "$tmp/ca.crt" "$LAB_CA_CRT"
+chmod 644 "$LAB_CA_CRT"
+
+echo "Created lab CA: $LAB_CA_CRT"
 }
 
 ca_import() {
-local tmp
-tmp=$(mktemp -d)
-trap "rm -rf $tmp" RETURN
 
-if kubectl -n "$LAB_CA_NS" get secret "$LAB_CA_SECRET" >/dev/null 2>&1; then
+if ! command -v secret-tool >/dev/null 2>&1 ; then
+  echo "secret-tool not found" >&2
+  return 1
+fi
+if ! secret-tool search name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
+  echo "Secret Service is not available" >&2
+  return 1
+fi
+
+if [ "$#" -ne 2 ]; then
+  echo "Usage: lab ca-import <ca.crt> <ca.key>" >&2
+  return 1
+fi
+
+local ca_crt="$1"
+local ca_key="$2"
+
+if [ ! -f "$ca_crt" ] || [ ! -f "$ca_key" ]; then
+  echo "No such file: $ca_crt or $ca_key" >&2
+  return 1
+fi
+
+
+
+if [ -f "$LAB_CA_CRT" ] && secret-tool lookup \
+     name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
   echo "CA already exists" >&2
   return 1
 fi
 
-if ! secret-tool lookup \
-      service lab-ca \
-      type certificate \
-      part tls.crt > "$tmp/ca.crt"; then
-    echo "CA certificate not found in secret store" >&2
-    return 1
-fi
-if ! secret-tool lookup \
-      service lab-ca \
-      type private-key \
-      part tls.key > "$tmp/ca.key"; then
-    echo "CA private key not found in secret store" >&2
-    return 1
-fi
-
-if [ "$(openssl x509 -in "$tmp/ca.crt" -noout -pubkey)" != "$(openssl pkey -in "$tmp/ca.key" -pubout)" ]; then
+if [ "$(openssl x509 -in "$ca_crt" -noout -pubkey)" != \
+     "$(openssl pkey -in "$ca_key" -pubout)" ]; then
   echo "Key does not match certificate" >&2
   return 1
 fi
 
-kubectl create ns "$LAB_CA_NS" 2>/dev/null || true
-kubectl -n "$LAB_CA_NS" create secret tls "$LAB_CA_SECRET" --cert="$tmp/ca.crt" --key="$tmp/ca.key"
-}
-
-
-ca_issue_https_cert() {
-local host="$1"
-local dir="${3:-}"
-local name="${host//./-}"
-
-if [ -z "$host" ]; then
-  echo "Usage: lab ca-issue-https-cert <hostname> [-d dir]" >&2
+if ! openssl x509 -in "$ca_crt" -noout -text |
+     grep -q 'CA:TRUE'; then
+  echo "Certificate is not a CA" >&2
   return 1
 fi
 
-kubectl apply -f - <<EOF
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: $name
-  namespace: $LAB_CA_NS
-spec:
-  secretName: $name-tls
-  dnsNames:
-    - $host
-    - "*.$host"
-  issuerRef:
-    name: lab-ca-issuer
-    kind: ClusterIssuer
-EOF
+secret-tool store \
+  --label="$LAB_CA_KEY_LABEL" \
+  name "$LAB_CA_KEY_NAME" < "$ca_key"
 
-kubectl -n "$LAB_CA_NS" wait --for=condition=Ready "certificate/$name" --timeout=120s
+mkdir -p "$(dirname "$LAB_CA_CRT")"
+cp "$ca_crt" "$LAB_CA_CRT"
+chmod 644 "$LAB_CA_CRT"
 
-if [ -z "$dir" ] && command -v secret-tool >/dev/null; then
-  kubectl -n "$LAB_CA_NS" get secret "$name-tls" -o 'jsonpath={.data.tls\.crt}' | base64 -d \
-    | secret-tool store --label="lab cert $host" lab-cert "$host" part tls.crt
-  kubectl -n "$LAB_CA_NS" get secret "$name-tls" -o 'jsonpath={.data.tls\.key}' | base64 -d \
-    | secret-tool store --label="lab key $host" lab-cert "$host" part tls.key
-  echo "Stored cert and key for $host in the keyring"
-  return 0
-fi
+echo "Imported lab CA: $LAB_CA_CRT"
+}   
 
-if [ -z "$dir" ]; then
-  dir="$LAB_DIR/.config"
-fi
-
-mkdir -p "$dir"
-kubectl -n "$LAB_CA_NS" get secret "$name-tls" -o 'jsonpath={.data.tls\.crt}' | base64 -d > "$dir/tls.crt"
-kubectl -n "$LAB_CA_NS" get secret "$name-tls" -o 'jsonpath={.data.tls\.key}' | base64 -d > "$dir/tls.key"
-echo "Wrote $dir/tls.crt and $dir/tls.key for $host"
-}
 
 
 run_seed_setup() {
@@ -1967,6 +1946,7 @@ run_node_setup
 
 up_cluster() {
 run_seed_setup
+ca_deploy
 #join_additional_cp_nodes
 join_workers
 fetch_kubeconfig
@@ -1984,6 +1964,7 @@ return 1
 }
 
 up() {
+ca_ensure   
 up_nodes;
 if has_cluster_node_roles; then
   up_cluster
@@ -1991,6 +1972,60 @@ else
   echo "No cluster node roles defined (seed/cp/wk); skipping cluster bootstrap."
 fi
 }
+ca_ensure() {
+if ! command -v secret-tool >/dev/null 2>&1; then
+  echo "secret-tool not found" >&2
+  return 1
+fi
+if [ -f "$LAB_CA_CRT" ] && secret-tool lookup name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
+  return 0
+fi
+ca_init
+}
+
+
+ca_deploy() {
+
+if ! command -v secret-tool >/dev/null 2>&1; then
+  echo "secret-tool not found" >&2
+  return 1
+fi
+
+if [ ! -f "$LAB_CA_CRT" ]; then
+  echo "Lab CA certificate not found: $LAB_CA_CRT" >&2
+  return 1
+fi
+
+if ! secret-tool lookup name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
+  echo "Lab CA private key not found in secret store" >&2
+  return 1
+fi
+
+local ip
+ip="$(node_ip "$(seed_node)")"
+
+ssh "$BASE_USER@$ip" 'sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f -' <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: $LAB_CA_SECRET
+  namespace: $LAB_CA_NS
+type: kubernetes.io/tls
+data:
+  tls.crt: $(base64 -w0 < "$LAB_CA_CRT")
+  tls.key: $(secret-tool lookup name "$LAB_CA_KEY_NAME" | base64 -w0)
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: lab-ca-issuer
+spec:
+  ca: 
+    secretName: $LAB_CA_SECRET
+EOF
+}
+
+
 
 start() {
 local vm_name
@@ -2160,7 +2195,7 @@ VALID_COMMANDS=(
   help
   ca_init
   ca_import
-  ca_issue_https_cert
+  
 )
 
 is_valid_command() {
