@@ -1920,6 +1920,98 @@ run_node_setup() {
   run_scripts_on_nodes "$BASE_DIR/node-setup/$NODE_SETUP/scripts.d" "${nodes[@]}"
 }
 
+ca_init() {
+
+if ! command -v secret-tool >/dev/null 2>&1 ; then
+  echo "secret-tool not found" >&2
+  return 1
+fi
+if ! secret-tool search name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
+  echo "Secret Service is not available" >&2
+  return 1
+fi
+
+if [ -f "$LAB_CA_CRT" ] && secret-tool lookup name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
+  echo "Lab CA already exists: $LAB_CA_CRT" >&2
+  return 1
+fi
+
+local tmp
+tmp="$(mktemp -d)"
+trap "rm -rf $tmp" RETURN
+
+openssl req -x509 -newkey rsa:4096 -nodes -days 3650 \
+  -keyout "$tmp/ca.key" -out "$tmp/ca.crt" \
+  -subj "/CN=lab-ca" -addext "basicConstraints=critical,CA:TRUE"
+
+secret-tool store \
+  --label="$LAB_CA_KEY_LABEL" \
+  name "$LAB_CA_KEY_NAME" < "$tmp/ca.key"
+
+mkdir -p "$(dirname "$LAB_CA_CRT")"
+cp "$tmp/ca.crt" "$LAB_CA_CRT"
+chmod 644 "$LAB_CA_CRT"
+
+echo "Created lab CA: $LAB_CA_CRT"
+}
+
+ca_import() {
+
+if ! command -v secret-tool >/dev/null 2>&1 ; then
+  echo "secret-tool not found" >&2
+  return 1
+fi
+if ! secret-tool search name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
+  echo "Secret Service is not available" >&2
+  return 1
+fi
+
+if [ "$#" -ne 2 ]; then
+  echo "Usage: lab ca-import <ca.crt> <ca.key>" >&2
+  return 1
+fi
+
+local ca_crt="$1"
+local ca_key="$2"
+
+if [ ! -f "$ca_crt" ] || [ ! -f "$ca_key" ]; then
+  echo "No such file: $ca_crt or $ca_key" >&2
+  return 1
+fi
+
+
+
+if [ -f "$LAB_CA_CRT" ] && secret-tool lookup \
+     name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
+  echo "CA already exists" >&2
+  return 1
+fi
+
+if [ "$(openssl x509 -in "$ca_crt" -noout -pubkey)" != \
+     "$(openssl pkey -in "$ca_key" -pubout)" ]; then
+  echo "Key does not match certificate" >&2
+  return 1
+fi
+
+if ! openssl x509 -in "$ca_crt" -noout -text |
+     grep -q 'CA:TRUE'; then
+  echo "Certificate is not a CA" >&2
+  return 1
+fi
+
+secret-tool store \
+  --label="$LAB_CA_KEY_LABEL" \
+  name "$LAB_CA_KEY_NAME" < "$ca_key"
+
+mkdir -p "$(dirname "$LAB_CA_CRT")"
+cp "$ca_crt" "$LAB_CA_CRT"
+chmod 644 "$LAB_CA_CRT"
+
+echo "Imported lab CA: $LAB_CA_CRT"
+}   
+
+
+
 run_seed_setup() {
   echo "Run $SEED_SETUP setup scripts on seed node"
   local seeds=()
@@ -2006,6 +2098,7 @@ run_node_setup
 
 up_cluster() {
 run_seed_setup
+ca_deploy
 #join_additional_cp_nodes
 join_workers
 fetch_kubeconfig
@@ -2023,6 +2116,7 @@ return 1
 }
 
 up() {
+ca_ensure   
 up_nodes;
 if has_cluster_node_roles; then
   up_cluster
@@ -2030,6 +2124,60 @@ else
   echo "No cluster node roles defined (seed/cp/wk); skipping cluster bootstrap."
 fi
 }
+ca_ensure() {
+if ! command -v secret-tool >/dev/null 2>&1; then
+  echo "secret-tool not found" >&2
+  return 1
+fi
+if [ -f "$LAB_CA_CRT" ] && secret-tool lookup name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
+  return 0
+fi
+ca_init
+}
+
+
+ca_deploy() {
+
+if ! command -v secret-tool >/dev/null 2>&1; then
+  echo "secret-tool not found" >&2
+  return 1
+fi
+
+if [ ! -f "$LAB_CA_CRT" ]; then
+  echo "Lab CA certificate not found: $LAB_CA_CRT" >&2
+  return 1
+fi
+
+if ! secret-tool lookup name "$LAB_CA_KEY_NAME" >/dev/null 2>&1; then
+  echo "Lab CA private key not found in secret store" >&2
+  return 1
+fi
+
+local ip
+ip="$(node_ip "$(seed_node)")"
+
+ssh "$BASE_USER@$ip" 'sudo KUBECONFIG=/etc/kubernetes/admin.conf kubectl apply -f -' <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: $LAB_CA_SECRET
+  namespace: $LAB_CA_NS
+type: kubernetes.io/tls
+data:
+  tls.crt: $(base64 -w0 < "$LAB_CA_CRT")
+  tls.key: $(secret-tool lookup name "$LAB_CA_KEY_NAME" | base64 -w0)
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: lab-ca-issuer
+spec:
+  ca: 
+    secretName: $LAB_CA_SECRET
+EOF
+}
+
+
 
 start() {
 check_disk_space || return 1
@@ -2369,6 +2517,9 @@ VALID_COMMANDS=(
   var
   keyPath
   help
+  ca_init
+  ca_import
+  
 )
 
 is_valid_command() {

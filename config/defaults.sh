@@ -54,3 +54,10 @@ NET_MASK=
 NET_PREFIX_LEN=
 DHCP_START=
 DHCP_END=
+
+LAB_CA_NS=cert-manager
+LAB_CA_SECRET=lab-ca-key-pair
+LAB_CA_CRT=~/.config/cluster-lab/ca.crt
+
+LAB_CA_KEY_NAME=lab-ca
+LAB_CA_KEY_LABEL="Lab CA private key"
