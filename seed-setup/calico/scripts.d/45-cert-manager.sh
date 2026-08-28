@@ -16,15 +16,4 @@ until [ -n "$(kubectl get validatingwebhookconfiguration cert-manager-webhook \
     sleep 1
 done
 
-# creating clusterIssuer 
-kubectl apply -f - <<'EOF'
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: lab-ca-issuer
-spec:
-  ca:
-    secretName: lab-ca-key-pair
-EOF
-
 
